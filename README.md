@@ -239,6 +239,6 @@ Other targets: `AtmosDaemon` (thin CLI over the engine, prints a 1 Hz diagnostic
 `TapSpike` (process-tap capture spike), `SpatialEngine` (the shared engine library).
 Full architecture plan: [`docs/PLAN.md`](docs/PLAN.md).
 
-The app bundle is produced by `App/build-app.sh` (ad-hoc signed, `LSUIElement`); it writes
+The app bundle is produced by running `App/build-app.sh` (ad-hoc signed, `LSUIElement`); it writes
 only to `dist/` and touches no system locations. Preview the panel in a window with
 `ATMOS_PREVIEW=1 open -n dist/atmos-control.app`.
