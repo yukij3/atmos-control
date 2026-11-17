@@ -163,6 +163,7 @@ public enum SpatialEngineError: Error, CustomStringConvertible {
 // MARK: - Engine
 
 public final class SpatialEngine: @unchecked Sendable {
+    public let controlQueue = DispatchQueue(label: "dev.atmoscontrol.audio-control", qos: .userInitiated)
     public private(set) var isRunning = false
     public var config = SpatialConfig()
     /// Optional setup logger (verbose property-set trace). nil = silent.
@@ -202,11 +203,12 @@ public final class SpatialEngine: @unchecked Sendable {
     /// True when the installed loopback exposes the full 7.1.4 (≥12) channel surface.
     public func surroundDriverInstalled() -> Bool { atmosControlChannelCount() >= kAtmos714Channels }
 
-    /// Output-capable devices, excluding the atmos-control loopback itself.
+    /// Output-capable devices, excluding the loopback driver and the active tap aggregate.
     public func outputDevices() -> [AudioOutputDevice] {
         let atmos = findAtmosControlDevice()
+        let capture = ctx?.unifiedDeviceID
         var out: [AudioOutputDevice] = []
-        for id in allDeviceIDs() where id != atmos && deviceHasChannels(id, scope: kAudioObjectPropertyScopeOutput) {
+        for id in allDeviceIDs() where id != atmos && id != capture && deviceHasChannels(id, scope: kAudioObjectPropertyScopeOutput) {
             let name = deviceName(id)
             out.append(AudioOutputDevice(id: id, name: name, isAirPods: name.localizedCaseInsensitiveContains("airpods")))
         }
@@ -256,6 +258,7 @@ public final class SpatialEngine: @unchecked Sendable {
             throw SpatialEngineError.setupFailed("capture nominal sample rate unreadable")
         }
         let isLoopbackCapture = (captureID == findAtmosControlDevice())
+        let unifiedTap = !isLoopbackCapture && deviceHasChannels(captureID, scope: kAudioObjectPropertyScopeOutput)
         selog("Capture device : [\(captureID)] \(deviceName(captureID)) @ \(Int(captureRate)) Hz")
         selog("Playback device: [\(outID)] \(deviceName(outID))")
 
@@ -265,43 +268,53 @@ public final class SpatialEngine: @unchecked Sendable {
         self.ctx = ctx
         let ctxPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(ctx).toOpaque())
 
-        // --- Capture unit (atmos-control → ring) ---
-        guard let captureUnit = makeHALOutputUnit() else { throw SpatialEngineError.setupFailed("capture unit") }
-        ctx.captureUnit = captureUnit
-        setEnableIO(captureUnit, enable: 0, scope: kAudioUnitScope_Output, element: 0, label: "capture")
-        setEnableIO(captureUnit, enable: 1, scope: kAudioUnitScope_Input, element: 1, label: "capture")
-        setCurrentDevice(captureUnit, deviceID: captureID, label: "capture")
-        var capFmt = captureChannels == 2 ? stereoFloat32Format(sampleRate: captureRate)
-                                          : makeFloatASBD(channels: UInt32(captureChannels), sampleRate: captureRate)
-        guard setStreamFormat(captureUnit, fmt: &capFmt, scope: kAudioUnitScope_Output, element: 1, label: "capture") else {
-            teardown(); throw SpatialEngineError.setupFailed("capture stream format")
-        }
-        var maxFrames: UInt32 = 4096; var mfSize = UInt32(MemoryLayout<UInt32>.size)
-        AudioUnitGetProperty(captureUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFrames, &mfSize)
-        ctx.captureABL = makeCaptureABL(maxFrames: maxFrames, channels: captureChannels)
-        ctx.captureBufSize = maxFrames
-        var inputCB = AURenderCallbackStruct(inputProc: captureInputCallback, inputProcRefCon: ctxPtr)
-        check(AudioUnitSetProperty(captureUnit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
-                                   &inputCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "capture SetInputCallback")
-        guard check(AudioUnitInitialize(captureUnit), "capture AudioUnitInitialize") else {
-            teardown(); throw SpatialEngineError.setupFailed("capture init")
-        }
+        var playMax: UInt32 = 4096
+        if unifiedTap {
+            ctx.captureBufSize = 4096
+            ctx.captureABL = makeCaptureABL(maxFrames: 4096, channels: 2)
+            ctx.unifiedOutputABL = makeCaptureABL(maxFrames: 4096, channels: 2)
+            guard !config.spatialize || abs(captureRate - 48_000) < 1 else {
+                teardown(); throw SpatialEngineError.setupFailed("Spatial tap requires a 48 kHz output; use an external microphone")
+            }
+        } else {
+            // --- Capture unit (atmos-control → ring) ---
+            guard let captureUnit = makeHALOutputUnit() else { throw SpatialEngineError.setupFailed("capture unit") }
+            ctx.captureUnit = captureUnit
+            setEnableIO(captureUnit, enable: 0, scope: kAudioUnitScope_Output, element: 0, label: "capture")
+            setEnableIO(captureUnit, enable: 1, scope: kAudioUnitScope_Input, element: 1, label: "capture")
+            setCurrentDevice(captureUnit, deviceID: captureID, label: "capture")
+            var capFmt = captureChannels == 2 ? stereoFloat32Format(sampleRate: captureRate)
+                                              : makeFloatASBD(channels: UInt32(captureChannels), sampleRate: captureRate)
+            guard setStreamFormat(captureUnit, fmt: &capFmt, scope: kAudioUnitScope_Output, element: 1, label: "capture") else {
+                teardown(); throw SpatialEngineError.setupFailed("capture stream format")
+            }
+            var maxFrames: UInt32 = 4096; var mfSize = UInt32(MemoryLayout<UInt32>.size)
+            AudioUnitGetProperty(captureUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFrames, &mfSize)
+            ctx.captureABL = makeCaptureABL(maxFrames: maxFrames, channels: captureChannels)
+            ctx.captureBufSize = maxFrames
+            var inputCB = AURenderCallbackStruct(inputProc: captureInputCallback, inputProcRefCon: ctxPtr)
+            check(AudioUnitSetProperty(captureUnit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
+                                       &inputCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "capture SetInputCallback")
+            guard check(AudioUnitInitialize(captureUnit), "capture AudioUnitInitialize") else {
+                teardown(); throw SpatialEngineError.setupFailed("capture init")
+            }
 
-        // --- Playback unit (ring/mixer → real output) ---
-        guard let playbackUnit = makeHALOutputUnit() else { teardown(); throw SpatialEngineError.setupFailed("playback unit") }
-        ctx.playbackUnit = playbackUnit
-        setEnableIO(playbackUnit, enable: 1, scope: kAudioUnitScope_Output, element: 0, label: "playback")
-        setEnableIO(playbackUnit, enable: 0, scope: kAudioUnitScope_Input, element: 1, label: "playback")
-        setCurrentDevice(playbackUnit, deviceID: outID, label: "playback")
-        // Spatialize: mixer output is 48 kHz. Passthrough: the ring holds capture-rate
-        // frames, so the playback input runs at captureRate and the AUHAL output-side
-        // converter resamples to the sink.
-        var playFmt = stereoFloat32Format(sampleRate: config.spatialize ? 48_000 : captureRate)
-        guard setStreamFormat(playbackUnit, fmt: &playFmt, scope: kAudioUnitScope_Input, element: 0, label: "playback") else {
-            teardown(); throw SpatialEngineError.setupFailed("playback stream format")
+            // --- Playback unit (ring/mixer → real output) ---
+            guard let playbackUnit = makeHALOutputUnit() else { teardown(); throw SpatialEngineError.setupFailed("playback unit") }
+            ctx.playbackUnit = playbackUnit
+            setEnableIO(playbackUnit, enable: 1, scope: kAudioUnitScope_Output, element: 0, label: "playback")
+            setEnableIO(playbackUnit, enable: 0, scope: kAudioUnitScope_Input, element: 1, label: "playback")
+            setCurrentDevice(playbackUnit, deviceID: outID, label: "playback")
+            // Spatialize: mixer output is 48 kHz. Passthrough: the ring holds capture-rate
+            // frames, so the playback input runs at captureRate and the AUHAL output-side
+            // converter resamples to the sink.
+            var playFmt = stereoFloat32Format(sampleRate: config.spatialize ? 48_000 : captureRate)
+            guard setStreamFormat(playbackUnit, fmt: &playFmt, scope: kAudioUnitScope_Input, element: 0, label: "playback") else {
+                teardown(); throw SpatialEngineError.setupFailed("playback stream format")
+            }
+            var pmSize = UInt32(MemoryLayout<UInt32>.size)
+            AudioUnitGetProperty(playbackUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &playMax, &pmSize)
         }
-        var playMax: UInt32 = 4096; var pmSize = UInt32(MemoryLayout<UInt32>.size)
-        AudioUnitGetProperty(playbackUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &playMax, &pmSize)
 
         // --- Spatial mixer ---
         if config.spatialize {
@@ -353,6 +366,23 @@ public final class SpatialEngine: @unchecked Sendable {
             ctx.spatialize = true   // publish last
         }
 
+        if unifiedTap {
+            ctx.unifiedDeviceID = captureID
+            var proc: AudioDeviceIOProcID?
+            guard check(AudioDeviceCreateIOProcID(captureID, unifiedTapCallback, ctxPtr, &proc), "unified CreateIOProc"),
+                  let proc else { teardown(); throw SpatialEngineError.setupFailed("unified IOProc") }
+            ctx.unifiedIOProc = proc
+            guard check(AudioDeviceStart(captureID, proc), "unified Start") else {
+                teardown(); throw SpatialEngineError.setupFailed("unified start")
+            }
+            installSampleRateListener(captureID)
+            isRunning = true
+            return
+        }
+        guard let captureUnit = ctx.captureUnit, let playbackUnit = ctx.playbackUnit else {
+            teardown(); throw SpatialEngineError.setupFailed("missing legacy units")
+        }
+
         var renderCB = AURenderCallbackStruct(inputProc: playbackRenderCallback, inputProcRefCon: ctxPtr)
         check(AudioUnitSetProperty(playbackUnit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
                                    &renderCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "playback SetRenderCallback")
@@ -364,8 +394,8 @@ public final class SpatialEngine: @unchecked Sendable {
         let bufFrames = deviceBufferFrameSize(outID)
         ctx.ring.prefill(frames: UInt64(2 * bufFrames))
         if isLoopbackCapture {
-            // Loopback: virtual-driver host clock vs sink clock drift → hold the fill
-            // inside ~1…3 device buffers. Tap mode is clock-coherent, so left OFF.
+            // Legacy loopback: virtual-driver host clock vs sink clock drift → hold the fill
+            // inside ~1…3 device buffers. The unified process tap returned above.
             ctx.ring.driftLow  = UInt64(bufFrames)
             ctx.ring.driftHigh = UInt64(3 * bufFrames)
             ctx.ring.driftEnabled = true
@@ -397,8 +427,10 @@ public final class SpatialEngine: @unchecked Sendable {
     private func teardown() {
         removeSampleRateListener()
         guard let ctx else { return }
+        if let proc = ctx.unifiedIOProc { AudioDeviceStop(ctx.unifiedDeviceID, proc) }
         if let c = ctx.captureUnit { AudioOutputUnitStop(c) }
         if let p = ctx.playbackUnit { AudioOutputUnitStop(p) }
+        if let proc = ctx.unifiedIOProc { AudioDeviceDestroyIOProcID(ctx.unifiedDeviceID, proc); ctx.unifiedIOProc = nil }
         if let m = ctx.spatialMixer { AudioUnitUninitialize(m); AudioComponentInstanceDispose(m); ctx.spatialMixer = nil }
         if let c = ctx.captureUnit { AudioUnitUninitialize(c); AudioComponentInstanceDispose(c); ctx.captureUnit = nil }
         if let p = ctx.playbackUnit { AudioUnitUninitialize(p); AudioComponentInstanceDispose(p); ctx.playbackUnit = nil }
@@ -414,6 +446,11 @@ public final class SpatialEngine: @unchecked Sendable {
             for ch in 0..<abl.count { abl[ch].mData?.deallocate() }
             free(abl.unsafeMutablePointer)
             ctx.captureABL = nil
+        }
+        if let abl = ctx.unifiedOutputABL {
+            for ch in 0..<abl.count { abl[ch].mData?.deallocate() }
+            free(abl.unsafeMutablePointer)
+            ctx.unifiedOutputABL = nil
         }
         self.ctx = nil
     }
@@ -447,7 +484,10 @@ public final class SpatialEngine: @unchecked Sendable {
     /// rebuild the graph at the new rate, then notify observers.
     private func handleFormatChange() {
         guard isRunning else { return }
-        attemptFormatRebuild(retriesLeft: 1)
+        controlQueue.async { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.attemptFormatRebuild(retriesLeft: 1)
+        }
     }
 
     /// Rebuild the graph at the current device rate. On failure retry once after a short
@@ -460,15 +500,15 @@ public final class SpatialEngine: @unchecked Sendable {
         stop()
         do {
             try start(outputDeviceID: out, captureDeviceID: cap)
-            MainActor.assumeIsolated { onFormatChange?(true) }
+            DispatchQueue.main.async { [weak self] in self?.onFormatChange?(true) }
         } catch {
             selog("format-change rebuild failed: \(error)")
             if retriesLeft > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                controlQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     self?.attemptFormatRebuild(retriesLeft: retriesLeft - 1)
                 }
             } else {
-                MainActor.assumeIsolated { onFormatChange?(false) }
+                DispatchQueue.main.async { [weak self] in self?.onFormatChange?(false) }
             }
         }
     }

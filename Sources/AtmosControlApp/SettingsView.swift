@@ -27,6 +27,7 @@ struct SettingsView: View {
             levels
         }
         .formStyle(.grouped)
+        .disabled(controller.isStarting)
         .tint(.instrument)
         .frame(minWidth: 460, idealWidth: 480, minHeight: 460, idealHeight: 640)
         .onAppear { controller.refreshDevices(); controller.settingsAppeared() }
