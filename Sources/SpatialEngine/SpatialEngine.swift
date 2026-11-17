@@ -204,7 +204,7 @@ public final class SpatialEngine: @unchecked Sendable {
 
     /// Output-capable devices, excluding the atmos-control loopback itself.
     public func outputDevices() -> [AudioOutputDevice] {
-        guard let atmos = findAtmosControlDevice() else { return [] }
+        let atmos = findAtmosControlDevice()
         var out: [AudioOutputDevice] = []
         for id in allDeviceIDs() where id != atmos && deviceHasChannels(id, scope: kAudioObjectPropertyScopeOutput) {
             let name = deviceName(id)

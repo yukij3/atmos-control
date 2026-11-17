@@ -4,6 +4,16 @@ import XCTest
 @testable import SpatialEngine
 
 final class DevicesTests: XCTestCase {
+    func testSelectedPhysicalOutputIsListedWithoutRequiringHALDriver() throws {
+        let selected = defaultOutputDeviceID()
+        guard selected != kAudioObjectUnknown,
+              deviceUID(selected) != kAtmosControlUID,
+              deviceHasChannels(selected, scope: kAudioObjectPropertyScopeOutput) else {
+            throw XCTSkip("No physical default output is available in this test environment")
+        }
+        XCTAssertTrue(SpatialEngine().outputDevices().contains { $0.id == selected })
+    }
+
     func testProcessTapAggregateDoesNotBecomeLoopbackDriver() throws {
         let driverBefore = findAtmosControlDevice()
         let description: [String: Any] = [
