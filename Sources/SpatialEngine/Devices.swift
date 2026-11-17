@@ -63,7 +63,7 @@ func deviceChannelCount(_ id: AudioDeviceID, scope: AudioObjectPropertyScope) ->
 
 func findAtmosControlDevice() -> AudioDeviceID? {
     for id in allDeviceIDs() where deviceUID(id) == kAtmosControlUID { return id }
-    for id in allDeviceIDs() where deviceName(id).lowercased().contains("atmos-control") { return id }
+    // Process-tap aggregates are named atmos-control-tap; only the HAL UID identifies the driver.
     return nil
 }
 

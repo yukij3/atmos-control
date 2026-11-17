@@ -7,6 +7,7 @@ let package = Package(
         .macOS("15.0")
     ],
     targets: [
+        .testTarget(name: "SpatialEngineTests", dependencies: ["SpatialEngine"]),
         // Phase 0 de-risk spike: a CLI harness that instantiates AUSpatialMixer,
         // configures personalized + head-tracked binaural rendering, plays a test
         // signal to the current output device (AirPods), and reads back whether
