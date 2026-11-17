@@ -35,6 +35,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key>  <string>15.0</string>
   <key>LSUIElement</key>             <true/>
   <key>NSHighResolutionCapable</key> <true/>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>atmos-control captures system audio locally to render spatial audio through your headphones.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>atmos-control reads system audio from the virtual output device in order to spatialize it.</string>
   <key>NSMotionUsageDescription</key>
