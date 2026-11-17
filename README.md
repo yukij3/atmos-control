@@ -40,6 +40,15 @@ reduces to one switch.
 4. **Output** — the binaural result plays to your headphones. Nothing is sent anywhere; all capture
    and processing is local.
 
+The Personalized path uses a device-scoped tap and a private aggregate whose main
+subdevice is the physical output. Capture, spatialization, and playback run in one
+IOProc on that output's clock; the system default output stays unchanged.
+
+This path currently requires a 48 kHz stereo Float32 output for spatial rendering.
+44.1 kHz source material can play through a 48 kHz output, but other hardware output
+rates, microphone/call-profile transitions, and arbitrary duplex interfaces still
+need validation. The optional loopback-driver modes keep their existing audio path.
+
 ## Capture modes
 
 atmos-control offers three ways to get audio into the engine. The default **Personalized** mode

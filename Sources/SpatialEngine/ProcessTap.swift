@@ -1,6 +1,6 @@
-// SpatialEngine/ProcessTap.swift — Core Audio process tap + tap-only aggregate.
+// SpatialEngine/ProcessTap.swift — Core Audio device-scoped tap + output-clocked aggregate.
 //
-// Captures the whole system mix (optionally MUTING the original apps so we can
+// Captures the selected output device mix (optionally MUTING the original apps so we can
 // re-render it) WITHOUT becoming the system default output. AirPods therefore stay
 // the default, and Apple's personalized HRTF (AUSpatialMixer property 3116) keeps
 // engaging — the thing the virtual-default-loopback path fundamentally blocks.
@@ -23,9 +23,8 @@ public enum ProcessTapError: Error, CustomStringConvertible {
     }
 }
 
-/// Owns one muting process tap + its private aggregate device. Create on the main
-/// thread; the returned aggregate id is used as a normal capture device.
-public final class ProcessTap {
+/// Owns one muting process tap + its private aggregate device. Lifecycle runs on the audio control queue; the aggregate shares the physical output clock.
+public final class ProcessTap: @unchecked Sendable {
     public private(set) var aggregateID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
     private var tapID: AudioObjectID = AudioObjectID(kAudioObjectUnknown)
 
@@ -36,9 +35,10 @@ public final class ProcessTap {
     /// Create the tap + private aggregate; returns the aggregate device id to capture from.
     /// `muted` silences the tapped apps at the hardware (we re-render their audio ourselves).
     @discardableResult
-    public func start(muted: Bool = true) throws -> AudioDeviceID {
+    public func start(muted: Bool = true, outputDeviceID: AudioDeviceID? = nil) throws -> AudioDeviceID {
         let selfObj = ProcessTap.translatePID(getpid())   // exclude ourselves → no feedback
-        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: [selfObj])
+        let outputUID = deviceUID(outputDeviceID ?? defaultOutputDeviceID())
+        let desc = CATapDescription(excludingProcesses: [selfObj], deviceUID: outputUID, stream: 0)
         desc.isPrivate = true
         // .mutedWhenTapped silences the tapped apps only while we're actively reading, so
         // if audio-capture consent is denied the user hears the original audio, not silence.
@@ -61,14 +61,24 @@ public final class ProcessTap {
             kAudioAggregateDeviceIsPrivateKey as String:     true,
             kAudioAggregateDeviceIsStackedKey as String:     false,
             kAudioAggregateDeviceTapAutoStartKey as String:  true,
-            kAudioAggregateDeviceSubDeviceListKey as String: [],
+            kAudioAggregateDeviceMainSubDeviceKey as String: outputUID,
+            kAudioAggregateDeviceSubDeviceListKey as String: [[kAudioSubDeviceUIDKey as String: outputUID]],
             kAudioAggregateDeviceTapListKey as String:       [tapEntry],
         ]
         var agg = AudioDeviceID(kAudioObjectUnknown)
         let asg = AudioHardwareCreateAggregateDevice(aggDict as CFDictionary, &agg)
         guard asg == noErr, agg != AudioDeviceID(kAudioObjectUnknown) else { destroy(); throw ProcessTapError.createAggregateFailed(asg) }
         aggregateID = agg
-        return agg
+        var aliveAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        for _ in 0..<30 {
+            var alive: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(agg, &aliveAddress, 0, nil, &size, &alive) == noErr, alive != 0 { return agg }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        destroy()
+        throw ProcessTapError.createAggregateFailed(kAudioHardwareNotReadyError)
     }
 
     public func stop() { destroy() }

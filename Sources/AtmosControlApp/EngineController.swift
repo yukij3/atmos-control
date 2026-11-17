@@ -24,6 +24,9 @@ enum CaptureMode: String, CaseIterable, Identifiable {
 @Observable
 final class EngineController {
     var isOn = false
+    var isStarting = false
+    @ObservationIgnored private var stopRequested = false
+    private var audioQueue: DispatchQueue { engine.controlQueue }
     var config = SpatialConfig()
     var lastError: String?
     var atmosPresent = false
@@ -87,6 +90,7 @@ final class EngineController {
     /// The panel never collapses on this — a false value only disables the power toggle and
     /// shows an inline notice (F11).
     var canRun: Bool {
+        if isStarting { return false }
         switch captureChoice {
         case .personalized:  return true
         case .virtualStereo: return atmosPresent
@@ -183,6 +187,7 @@ final class EngineController {
         selectedOutputID = dev?.id
         if let d = dev { outputName = d.name; config.outputType = outputType(for: d) }
         guard isOn else { engine.config = config; return }
+        if captureMode == .processTap { powerOff(); powerOn(); return }
         engine.stop()
         engine.config = config
         do { try engine.start(outputDeviceID: dev?.id, captureDeviceID: activeCaptureID); activeSinkID = dev?.id; lastError = nil }
@@ -194,6 +199,7 @@ final class EngineController {
     /// CoreAudio device list or default-output changed. Keep the picker fresh and,
     /// if running, fail over when our real sink has vanished (e.g. AirPods unplugged).
     private func handleDeviceChange() {
+        guard !isStarting else { return }
         guard !handlingChange else { return }
         handlingChange = true
         defer { handlingChange = false }
@@ -217,6 +223,7 @@ final class EngineController {
     /// Our render sink disappeared mid-session — fail over to another real device if one
     /// exists (atmos-control stays the capture default), else power down safely.
     private func recoverFromLostSink(_ devices: [AudioOutputDevice]) {
+        if captureMode == .processTap { selectedOutputID = nil; powerOff(); powerOn(); return }
         selectedOutputID = nil
         guard let fallback = devices.first(where: { $0.isAirPods }) ?? devices.first(where: { !$0.isAirPods }) ?? devices.first else {
             lastError = "Output device disconnected — engine stopped."
@@ -306,6 +313,7 @@ final class EngineController {
     func toggle() { isOn ? powerOff() : powerOn() }
 
     func powerOn() {
+        guard !isStarting, !isOn else { return }
         atmosPresent = engine.atmosControlPresent()
         surroundDriverInstalled = engine.surroundDriverInstalled()
         permissionNeeded = false
@@ -342,29 +350,58 @@ final class EngineController {
         if let sel = selectedOutputID, let d = devices.first(where: { $0.id == sel }) { real = d }
         else { real = devices.first(where: { $0.id == current.id }) ?? devices.first(where: { $0.isAirPods }) }
 
-        do {
-            let aggID = try tap.start(muted: true)
-            if let r = real { config.outputType = outputType(for: r); outputName = r.name }
-            engine.config = config
-            try engine.start(outputDeviceID: real?.id, captureDeviceID: aggID)
-            activeCaptureID = aggID
-            activeSinkID = real?.id
-            savedDefault = nil
-            isOn = true
-            lastError = nil
-            permissionNeeded = false
-            updateActivity()
-        } catch {
-            tap.stop()
-            // Distinguish a (likely) consent denial from any other tap failure. Tap CREATION
-            // failing is overwhelmingly the audio-capture TCC gate; aggregate/UID failures are
-            // infrastructure errors. Never auto-fall-back to loopback (that mutates routing).
-            if let e = error as? ProcessTapError, case .createTapFailed = e {
-                permissionNeeded = true
-                lastError = nil
-            } else {
-                permissionNeeded = false
-                lastError = "Personalized capture unavailable: \(error)."
+        if let r = real { config.outputType = outputType(for: r); outputName = r.name }
+        let engine = self.engine, tap = self.tap, snapshot = config
+        performAudioChange({
+            do {
+                let aggregate = try tap.start(muted: true, outputDeviceID: real?.id)
+                engine.config = snapshot
+                try engine.start(outputDeviceID: real?.id, captureDeviceID: aggregate)
+                return aggregate
+            } catch {
+                engine.stop(); tap.stop()
+                throw error
+            }
+        }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let aggregate):
+                self.activeCaptureID = aggregate
+                self.activeSinkID = real?.id
+                self.savedDefault = nil
+                self.isOn = true
+                self.lastError = nil
+                self.permissionNeeded = false
+                self.updateActivity()
+            case .failure(let error):
+                if let e = error as? ProcessTapError, case .createTapFailed = e {
+                    self.permissionNeeded = true
+                    self.lastError = nil
+                } else {
+                    self.permissionNeeded = false
+                    self.lastError = "Personalized capture unavailable: \(error)."
+                }
+            }
+        }
+    }
+
+    // Keep blocking Core Audio registration off the UI thread.
+    // isStarting excludes overlapping UI requests.
+    private func performAudioChange<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T,
+        completion: @escaping @MainActor @Sendable (Result<T, Error>) -> Void
+    ) {
+        guard !isStarting else { return }
+        isStarting = true
+        stopRequested = false
+        stopPolling()
+        audioQueue.async { [weak self] in
+            let result = Result(catching: operation)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isStarting = false
+                completion(result)
+                if self.stopRequested { self.stopRequested = false; self.powerOff() }
             }
         }
     }
@@ -406,6 +443,7 @@ final class EngineController {
     }
 
     func powerOff() {
+        if isStarting { stopRequested = true; return }
         engine.stop()
         if tap.isActive { tap.stop() }
         // Restore the system default ONLY if loopback mode actually hijacked it (savedDefault
@@ -449,7 +487,19 @@ final class EngineController {
     /// Apply a rebuild-class config change (output type, HRTF, algorithm, source mode,
     /// head tracking). Brief audio gap while running.
     func applyConfig() {
+        guard !isStarting else { return }
         guard isOn else { engine.config = config; return }
+        if captureMode == .processTap {
+            let engine = self.engine, snapshot = config
+            performAudioChange({ try engine.reconfigure(snapshot) }) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success: self.updateActivity()
+                case .failure(let error): self.lastError = "\(error)"; self.powerOff()
+                }
+            }
+            return
+        }
         do { try engine.reconfigure(config); updateActivity() }
         catch { lastError = "\(error)"; powerOff() }
     }
