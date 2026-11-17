@@ -51,7 +51,7 @@ struct PanelView: View {
             statusStrip
             visualizerRow
             Divider()
-            controls
+            controls.disabled(controller.isStarting)
 
             if controller.permissionNeeded { permissionNotice }
             if let notice = runNotice { runNoticeRow(notice) }

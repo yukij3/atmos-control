@@ -251,6 +251,9 @@ final class RingBuffer {
 final class Ctx: @unchecked Sendable {
     let channels: Int
     let ring: RingBuffer
+    var unifiedDeviceID: AudioDeviceID = 0
+    var unifiedIOProc: AudioDeviceIOProcID? = nil
+    var unifiedOutputABL: UnsafeMutableAudioBufferListPointer? = nil
     var captureUnit:  AudioUnit? = nil
     var playbackUnit: AudioUnit? = nil
     var totalCaptured: UInt64 = 0
