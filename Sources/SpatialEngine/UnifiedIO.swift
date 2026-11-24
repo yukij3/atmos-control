@@ -163,9 +163,12 @@ nonisolated(unsafe) let unifiedTapCallback: AudioDeviceIOProc = {
           let left = input[0].mData?.assumingMemoryBound(to: Float.self),
           let right = input[1].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
 
-    let layout = ctx.unifiedLayout
+    // Read the two POD enums directly: copying the whole layout struct would retain/release
+    // its stream-index array on the IO thread.
+    let inLayout = ctx.unifiedLayout.input
+    let outLayout = ctx.unifiedLayout.output
     let n: UInt32
-    switch layout.output {
+    switch outLayout {
     case .interleavedStereo(let idx):
         guard idx < outs.count, outs[idx].mNumberChannels == 2 else { return noErr }
         n = outs[idx].mDataByteSize / 8
@@ -181,7 +184,7 @@ nonisolated(unsafe) let unifiedTapCallback: AudioDeviceIOProc = {
     guard n > 0, n <= ctx.captureBufSize else { return noErr }
     let count = Int(n)
 
-    switch layout.input {
+    switch inLayout {
     case .interleavedStereo(let idx):
         guard idx < ins.count, ins[idx].mNumberChannels == 2,
               ins[idx].mDataByteSize >= n * 8, let raw = ins[idx].mData else { return noErr }
@@ -221,7 +224,7 @@ nonisolated(unsafe) let unifiedTapCallback: AudioDeviceIOProc = {
           let l = rendered[0].mData?.assumingMemoryBound(to: Float.self),
           let r = rendered[1].mData?.assumingMemoryBound(to: Float.self) else { return status }
 
-    switch layout.output {
+    switch outLayout {
     case .interleavedStereo(let idx):
         guard let raw = outs[idx].mData else { return noErr }
         let target = raw.assumingMemoryBound(to: Float.self)

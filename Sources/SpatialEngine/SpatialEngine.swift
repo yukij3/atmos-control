@@ -417,19 +417,24 @@ public final class SpatialEngine: @unchecked Sendable {
                   let proc else { teardown(); throw SpatialEngineError.setupFailed("unified IOProc") }
             ctx.unifiedIOProc = proc
             if ctx.unifiedLayout.totalInputStreams > 0 {
-                _ = check(setIOProcStreamUsage(
+                // Fatal: if this fails the physical mic stream stays enabled, which flips
+                // AirPods into the call (HFP) profile for the whole session.
+                guard check(setIOProcStreamUsage(
                     captureID,
                     proc: proc,
                     scope: kAudioObjectPropertyScopeInput,
                     enabledStreams: Set(ctx.unifiedLayout.enabledInputStreams),
                     totalStreams: ctx.unifiedLayout.totalInputStreams
-                ), "unified Input IOProcStreamUsage")
+                ), "unified Input IOProcStreamUsage") else {
+                    teardown(); throw SpatialEngineError.setupFailed("unified input stream usage")
+                }
             }
             guard check(AudioDeviceStart(captureID, proc), "unified Start") else {
                 teardown(); throw SpatialEngineError.setupFailed("unified start")
             }
             let token = sessionToken.wrappingAdd(1, ordering: .releasing).newValue
-            installFormatListeners(captureID: captureID, outputID: outID, rate: captureRate, token: token)
+            installFormatListeners(captureID: captureID, outputID: outID, rate: captureRate, token: token,
+                                   maxFrames: ctx.captureBufSize)
             isRunning = true
             return
         }
@@ -531,7 +536,11 @@ public final class SpatialEngine: @unchecked Sendable {
 
     // MARK: Format-change listeners
 
-    private func installFormatListeners(captureID: AudioDeviceID, outputID: AudioDeviceID, rate captureRate: Double, token: UInt64) {
+    /// `maxFrames` (unified path only) is the staging capacity the IOProc was sized for: if the
+    /// device IO buffer grows past it the callback can only emit silence, so that counts as a
+    /// format change and triggers a rebuild with larger buffers.
+    private func installFormatListeners(captureID: AudioDeviceID, outputID: AudioDeviceID, rate captureRate: Double,
+                                        token: UInt64, maxFrames: UInt32? = nil) {
         let initialOutRate = deviceNominalSampleRate(outputID)
         let initialCapIn = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeInput)
         let initialCapOut = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeOutput)
@@ -546,7 +555,10 @@ public final class SpatialEngine: @unchecked Sendable {
             let layoutChanged = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeInput) != initialCapIn
                 || deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeOutput) != initialCapOut
                 || deviceStreamChannelCounts(outputID, scope: kAudioObjectPropertyScopeOutput) != initialOut
-            guard capRateChanged || outRateChanged || layoutChanged else { return }
+            let bufferOutgrown = maxFrames.map {
+                max(deviceBufferFrameSize(captureID), deviceBufferFrameSize(outputID)) > $0
+            } ?? false
+            guard capRateChanged || outRateChanged || layoutChanged || bufferOutgrown else { return }
             self.onFormatChange?()
         }
 
@@ -564,6 +576,9 @@ public final class SpatialEngine: @unchecked Sendable {
         for dev in Set([captureID, outputID]) {
             add(dev, selector: kAudioDevicePropertyNominalSampleRate, scope: kAudioObjectPropertyScopeGlobal)
             add(dev, selector: kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeOutput)
+            if maxFrames != nil {
+                add(dev, selector: kAudioDevicePropertyBufferFrameSize, scope: kAudioObjectPropertyScopeGlobal)
+            }
         }
         add(captureID, selector: kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeInput)
     }
