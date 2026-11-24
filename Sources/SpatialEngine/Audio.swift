@@ -251,6 +251,10 @@ final class RingBuffer {
 final class Ctx: @unchecked Sendable {
     let channels: Int
     let ring: RingBuffer
+    var unifiedDeviceID: AudioDeviceID = 0
+    var unifiedIOProc: AudioDeviceIOProcID? = nil
+    var unifiedOutputABL: UnsafeMutableAudioBufferListPointer? = nil
+    var unifiedLayout: UnifiedBufferLayout = .defaultStereoInterleaved
     var captureUnit:  AudioUnit? = nil
     var playbackUnit: AudioUnit? = nil
     var totalCaptured: UInt64 = 0
@@ -543,7 +547,8 @@ func setU32(_ unit: AudioUnit, _ prop: AudioUnitPropertyID, scope: AudioUnitScop
 func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: SourceRenderMode,
                       algo: UInt32, algoName: String, outputType: UInt32, outputTypeName: String,
                       hrtfMode: UInt32, hrtfModeName: String, headTrack: UInt32,
-                      inputSampleRate: Double, renderFlags: UInt32, distanceParams: DistanceParams,
+                      inputSampleRate: Double, outputSampleRate: Double = 48_000,
+                      renderFlags: UInt32, distanceParams: DistanceParams,
                       attenCurve: UInt32, reverbEnabled: Bool, reverbRoomType: UInt32) -> AudioUnit? {
     var desc = AudioComponentDescription(
         componentType: kAudioUnitType_Mixer, componentSubType: kAudioUnitSubType_SpatialMixer,
@@ -560,10 +565,10 @@ func makeSpatialMixer(ctxPtr: UnsafeMutableRawPointer, maxFrames: UInt32, mode: 
     let asbdSize  = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
     let srcMode:  UInt32 = bed ? kSrcModeAmbienceBed : kSrcModePointSource
 
-    // Output is always stereo binaural at 48 kHz (mismatched in/out rates SRC per bus).
-    var stereoFmt = makeFloatASBD(channels: 2)
+    // Output is stereo binaural at outputSampleRate (48 kHz in loopback; native device rate in unified tap).
+    var stereoFmt = makeFloatASBD(channels: 2, sampleRate: outputSampleRate)
     guard check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &stereoFmt, asbdSize),
-                "spatial StreamFormat Output/0 = stereo48k") else {
+                "spatial StreamFormat Output/0 = stereo@\(Int(outputSampleRate))") else {
         AudioComponentInstanceDispose(unit); return nil
     }
 

@@ -27,6 +27,7 @@ struct SettingsView: View {
             levels
         }
         .formStyle(.grouped)
+        .disabled(controller.isStarting)
         .tint(.instrument)
         .frame(minWidth: 460, idealWidth: 480, minHeight: 460, idealHeight: 640)
         .onAppear { controller.refreshDevices(); controller.settingsAppeared() }
@@ -57,6 +58,11 @@ struct SettingsView: View {
                     Text(d.name).tag(AudioDeviceID?.some(d.id))
                 }
             }
+            .disabled(controller.captureMode == .processTap)
+            if controller.captureMode == .processTap {
+                Text("Personalized capture follows the macOS default output device. Switch outputs in Control Center or Sound settings.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             Picker("Output type", selection: rebuild(\.outputType)) {
                 ForEach(OutputType.allCases) { Text($0.label).tag($0) }
             }
@@ -84,7 +90,7 @@ struct SettingsView: View {
                 .padding(.vertical, 4)
 
             Picker("Source mode", selection: rebuild(\.sourceMode)) {
-                ForEach(SourceRenderMode.allCases) { Text($0.label).tag($0) }
+                ForEach(availableSourceModes) { Text($0.label).tag($0) }
             }
             Text(sourceModeExplainer)
                 .font(.footnote).foregroundStyle(.secondary)
@@ -252,8 +258,15 @@ struct SettingsView: View {
                 set: { controller.config[keyPath: kp] = $0; controller.applyConfig() })
     }
 
+    private var availableSourceModes: [SourceRenderMode] {
+        if controller.captureMode == .processTap {
+            return SourceRenderMode.stereoModes
+        }
+        return controller.surroundDriverInstalled ? SourceRenderMode.allCases : SourceRenderMode.stereoModes
+    }
+
     private var outputBinding: Binding<AudioDeviceID?> {
-        Binding(get: { controller.selectedOutputID },
+        Binding(get: { controller.captureMode == .processTap ? nil : controller.selectedOutputID },
                 set: { id in controller.selectOutput(controller.outputs.first(where: { $0.id == id })) })
     }
 

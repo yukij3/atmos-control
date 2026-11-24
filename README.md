@@ -40,6 +40,13 @@ reduces to one switch.
 4. **Output** — the binaural result plays to your headphones. Nothing is sent anywhere; all capture
    and processing is local.
 
+The Personalized path uses a device-scoped tap and a private aggregate whose main
+subdevice is the system default output. Capture, spatialization, and playback run in one
+IOProc on that output's clock and native sample rate, without changing the system default
+output. Switching the default output or renegotiating a Bluetooth call profile rebuilds
+the graph automatically; unsupported multichannel output layouts fail cleanly at start.
+The optional loopback-driver modes keep their existing audio path.
+
 ## Capture modes
 
 atmos-control offers three ways to get audio into the engine. The default **Personalized** mode
