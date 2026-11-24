@@ -26,28 +26,28 @@ func runTapSpike() {
 
     print("=== TapSpike — personalized HRTF (3116) via muting process tap ===")
 
-    // --- 1. Muting process tap → private aggregate (the capture device) ---
-    let tap = ProcessTap()
-    let aggID: AudioDeviceID
-    do {
-        aggID = try tap.start(muted: muted)
-    } catch {
-        print("  ERR \(error)"); exit(1)
-    }
-    print("tap aggregate device = \(aggID)  (muted=\(muted))")
-
-    // --- 2. Resolve the real output (AirPods); confirm the default is UNCHANGED ---
+    // --- 1. Resolve the target output (default output / requested device) ---
     let engine = SpatialEngine()
     engine.logger = { print($0) }
     let outs = engine.outputDevices()
     let wanted = env("OUTPUT_DEVICE")
     let out: AudioOutputDevice? = {
         if let w = wanted, !w.isEmpty { return outs.first { $0.name.localizedCaseInsensitiveContains(w) } }
-        return outs.first { $0.isAirPods } ?? outs.first { $0.id == SpatialEngine.currentDefaultOutput().id }
+        return outs.first { $0.id == SpatialEngine.currentDefaultOutput().id } ?? outs.first { $0.isAirPods }
     }()
     let defBefore = SpatialEngine.currentDefaultOutput()
     print("default output = [\(defBefore.id)] \(defBefore.name)  (must be AirPods for 3116=YES)")
     if out?.isAirPods != true { print("  WARN no AirPods output found — 3116 will read NO (plumbing-only run)") }
+
+    // --- 2. Muting process tap → private aggregate bound to the same output ---
+    let tap = ProcessTap()
+    let aggID: AudioDeviceID
+    do {
+        aggID = try tap.start(muted: muted, outputDeviceID: out?.id)
+    } catch {
+        print("  ERR \(error)"); exit(1)
+    }
+    print("tap aggregate device = \(aggID)  (muted=\(muted))")
 
     // --- 3. Spatialize the tapped mix → AirPods, personalization forced on ---
     var cfg = SpatialConfig()

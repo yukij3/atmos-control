@@ -37,7 +37,9 @@ public final class ProcessTap: @unchecked Sendable {
     @discardableResult
     public func start(muted: Bool = true, outputDeviceID: AudioDeviceID? = nil) throws -> AudioDeviceID {
         let selfObj = ProcessTap.translatePID(getpid())   // exclude ourselves → no feedback
-        let outputUID = deviceUID(outputDeviceID ?? defaultOutputDeviceID())
+        let targetID = outputDeviceID ?? defaultOutputDeviceID()
+        let outputUID = deviceUID(targetID)
+        guard !outputUID.isEmpty else { throw ProcessTapError.createAggregateFailed(kAudioHardwareBadDeviceError) }
         let desc = CATapDescription(excludingProcesses: [selfObj], deviceUID: outputUID, stream: 0)
         desc.isPrivate = true
         // .mutedWhenTapped silences the tapped apps only while we're actively reading, so
@@ -51,9 +53,10 @@ public final class ProcessTap: @unchecked Sendable {
 
         guard let uid = ProcessTap.tapUID(tap) else { destroy(); throw ProcessTapError.tapUIDUnavailable }
 
+        // The tap is scoped to the aggregate's main physical output, so it already shares that clock.
         let tapEntry: [String: Any] = [
             kAudioSubTapUIDKey as String: uid,
-            kAudioSubTapDriftCompensationKey as String: true,
+            kAudioSubTapDriftCompensationKey as String: false,
         ]
         let aggDict: [String: Any] = [
             kAudioAggregateDeviceNameKey as String:          "atmos-control-tap",
@@ -71,11 +74,11 @@ public final class ProcessTap: @unchecked Sendable {
         aggregateID = agg
         var aliveAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsAlive,
             mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        for _ in 0..<30 {
+        for _ in 0..<300 {
             var alive: UInt32 = 0
             var size = UInt32(MemoryLayout<UInt32>.size)
             if AudioObjectGetPropertyData(agg, &aliveAddress, 0, nil, &size, &alive) == noErr, alive != 0 { return agg }
-            Thread.sleep(forTimeInterval: 0.1)
+            Thread.sleep(forTimeInterval: 0.01)
         }
         destroy()
         throw ProcessTapError.createAggregateFailed(kAudioHardwareNotReadyError)

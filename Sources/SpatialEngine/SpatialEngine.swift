@@ -1,12 +1,14 @@
 // SpatialEngine — public API. Drives the proven capture → AUSpatialMixer →
 // output graph; consumed by both the AtmosDaemon CLI and the SwiftUI app.
 //
-// Threading: all SpatialEngine methods are intended to be called from the main
-// thread (UI / CLI loop). The real-time HAL threads touch only the internal Ctx.
+// Threading: callers must serialize lifecycle calls (start/stop/reconfigure) and live
+// parameter/telemetry calls (pollState/updateSource/updateReverb) so they never overlap.
+// The real-time HAL threads touch only the internal Ctx.
 
 import CoreAudio
 import AudioToolbox
 import Dispatch
+import Synchronization
 
 // MARK: - Public config types
 
@@ -83,6 +85,10 @@ public enum SourceRenderMode: String, CaseIterable, Sendable, Identifiable {
     var isSurroundBed: Bool { self == .surroundBed714 }
     var isSurround: Bool { self == .surround714 }        // 12 mono buses (11 point + LFE bypass)
     var isDualPoint: Bool { self == .dualPointStereo }
+    /// True for 12-channel 7.1.4 modes (supported only by the 12-channel loopback driver).
+    public var isSurroundMode: Bool { self == .surround714 || self == .surroundBed714 }
+    /// Stereo and mono modes supported by 2-channel capture paths (including Personalized tap).
+    public static let stereoModes: [SourceRenderMode] = [.dualPointStereo, .ambienceBedStereo, .pointSourceMono]
     /// Ring / capture channel count required for this mode.
     var captureChannels: Int { (self == .surround714 || self == .surroundBed714) ? kAtmos714Channels : 2 }
     var inputBusCount: UInt32 {
@@ -163,28 +169,33 @@ public enum SpatialEngineError: Error, CustomStringConvertible {
 // MARK: - Engine
 
 public final class SpatialEngine: @unchecked Sendable {
-    public let controlQueue = DispatchQueue(label: "dev.atmoscontrol.audio-control", qos: .userInitiated)
     public private(set) var isRunning = false
     public var config = SpatialConfig()
     /// Optional setup logger (verbose property-set trace). nil = silent.
     public var logger: ((String) -> Void)? = nil
-    /// Fired on the main queue after a capture-device nominal-sample-rate change is
-    /// handled. The Bool is the rebuild outcome: `true` = the graph is running again at
-    /// the new rate; `false` = the rebuild failed (after one retry) and the engine is now
-    /// stopped, so the owner MUST tear down (in processTap mode the muting tap otherwise
-    /// keeps silencing all system audio). The rebuild itself runs internally first.
-    public var onFormatChange: ((Bool) -> Void)? = nil
+    /// Fired on the main queue when the active capture or output device changes its nominal
+    /// sample rate or stream channel layout while running. The engine never rebuilds itself
+    /// on a private queue; the owner serializes any rebuild or teardown on its own queue.
+    public var onFormatChange: (() -> Void)? = nil
 
     private var ctx: Ctx?
     private var outputDeviceID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
     private var startedCaptureID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)  // capture device resolved at start()
-    private var rateListenerDevice: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
-    private var rateListenerBlock: AudioObjectPropertyListenerBlock? = nil
+    private var activeSourceMode: SourceRenderMode = .dualPointStereo
+    private let activeUnifiedDeviceID = Atomic<UInt32>(UInt32(kAudioObjectUnknown))
+    private let sessionToken = Atomic<UInt64>(0)
+    private var formatListeners: [(AudioDeviceID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private var cachedOutputName = ""        // device name only changes on start / sink-swap
     private var pollTick = 0                  // downsample the 3116 HAL read
     private var cached3116 = false
 
     public init() {}
+
+    /// Effective render mode for the active capture path. The unified process-tap path always
+    /// captures stereo/mono (2 staging channels), so 12-channel surround modes clamp to stereo.
+    static func effectiveSourceMode(_ mode: SourceRenderMode, unifiedTap: Bool) -> SourceRenderMode {
+        (unifiedTap && mode.isSurroundMode) ? .dualPointStereo : mode
+    }
 
     // MARK: Device discovery
 
@@ -203,12 +214,14 @@ public final class SpatialEngine: @unchecked Sendable {
     /// True when the installed loopback exposes the full 7.1.4 (≥12) channel surface.
     public func surroundDriverInstalled() -> Bool { atmosControlChannelCount() >= kAtmos714Channels }
 
-    /// Output-capable devices, excluding the loopback driver and the active tap aggregate.
+    /// Output-capable devices, excluding the loopback driver and any active tap aggregate.
     public func outputDevices() -> [AudioOutputDevice] {
         let atmos = findAtmosControlDevice()
-        let capture = ctx?.unifiedDeviceID
+        let activeUnified = AudioDeviceID(activeUnifiedDeviceID.load(ordering: .acquiring))
         var out: [AudioOutputDevice] = []
-        for id in allDeviceIDs() where id != atmos && id != capture && deviceHasChannels(id, scope: kAudioObjectPropertyScopeOutput) {
+        for id in allDeviceIDs() where id != atmos && id != activeUnified
+            && deviceName(id) != "atmos-control-tap"
+            && deviceHasChannels(id, scope: kAudioObjectPropertyScopeOutput) {
             let name = deviceName(id)
             out.append(AudioOutputDevice(id: id, name: name, isAirPods: name.localizedCaseInsensitiveContains("airpods")))
         }
@@ -250,32 +263,60 @@ public final class SpatialEngine: @unchecked Sendable {
             captureID = atmosID
         }
         startedCaptureID = captureID   // remember so reconfigure()'s rebuild keeps the same capture source
-        let outID = try resolveOutput(requested: requested, atmosID: captureID)
+        let isLoopbackCapture = (captureID == findAtmosControlDevice())
+        let unifiedTap = !isLoopbackCapture && deviceHasChannels(captureID, scope: kAudioObjectPropertyScopeOutput)
+        let outID: AudioDeviceID
+        if unifiedTap {
+            outID = try resolveUnifiedOutput(requested: requested, aggregateID: captureID)
+        } else {
+            outID = try resolveOutput(requested: requested, atmosID: captureID)
+        }
         outputDeviceID = outID
         cachedOutputName = deviceName(outID)
         pollTick = 0; cached3116 = false
         guard let captureRate = deviceNominalSampleRate(captureID) else {
             throw SpatialEngineError.setupFailed("capture nominal sample rate unreadable")
         }
-        let isLoopbackCapture = (captureID == findAtmosControlDevice())
-        let unifiedTap = !isLoopbackCapture && deviceHasChannels(captureID, scope: kAudioObjectPropertyScopeOutput)
         selog("Capture device : [\(captureID)] \(deviceName(captureID)) @ \(Int(captureRate)) Hz")
         selog("Playback device: [\(outID)] \(deviceName(outID))")
 
-        // Surround modes capture 12ch from the 7.1.4 loopback; all other modes stereo.
-        let captureChannels = config.spatialize ? config.sourceMode.captureChannels : 2
+        // Surround modes capture 12ch from the 7.1.4 loopback; unified tap always stages stereo.
+        let effectiveMode = Self.effectiveSourceMode(config.sourceMode, unifiedTap: unifiedTap)
+        activeSourceMode = effectiveMode
+        let captureChannels = (config.spatialize && !unifiedTap) ? effectiveMode.captureChannels : 2
         let ctx = Ctx(channels: captureChannels)
         self.ctx = ctx
         let ctxPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(ctx).toOpaque())
 
         var playMax: UInt32 = 4096
         if unifiedTap {
-            ctx.captureBufSize = 4096
-            ctx.captureABL = makeCaptureABL(maxFrames: 4096, channels: 2)
-            ctx.unifiedOutputABL = makeCaptureABL(maxFrames: 4096, channels: 2)
-            guard !config.spatialize || abs(captureRate - 48_000) < 1 else {
-                teardown(); throw SpatialEngineError.setupFailed("Spatial tap requires a 48 kHz output; use an external microphone")
+            let inputChannels = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeInput)
+            let physicalInputCount = deviceStreamChannelCounts(outID, scope: kAudioObjectPropertyScopeInput).count
+            let outputChannels = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeOutput)
+            guard let inputFormats = deviceStreamVirtualFormats(captureID, scope: kAudioObjectPropertyScopeInput),
+                  let outputFormats = deviceStreamVirtualFormats(captureID, scope: kAudioObjectPropertyScopeOutput) else {
+                teardown()
+                throw SpatialEngineError.setupFailed("unable to read aggregate stream virtual formats")
             }
+            let layout: UnifiedBufferLayout
+            do {
+                layout = try UnifiedBufferLayout.resolve(
+                    inputChannels: inputChannels,
+                    physicalInputCount: physicalInputCount,
+                    outputChannels: outputChannels,
+                    inputFormats: inputFormats,
+                    outputFormats: outputFormats
+                )
+            } catch {
+                teardown()
+                throw error
+            }
+            let maxF = max(deviceBufferFrameSize(outID) * 2, deviceBufferFrameSize(captureID) * 2, 4096)
+            playMax = maxF
+            ctx.captureBufSize = maxF
+            ctx.unifiedLayout = layout
+            ctx.captureABL = makeCaptureABL(maxFrames: maxF, channels: 2)
+            ctx.unifiedOutputABL = makeCaptureABL(maxFrames: maxF, channels: 2)
         } else {
             // --- Capture unit (atmos-control → ring) ---
             guard let captureUnit = makeHALOutputUnit() else { throw SpatialEngineError.setupFailed("capture unit") }
@@ -318,7 +359,7 @@ public final class SpatialEngine: @unchecked Sendable {
 
         // --- Spatial mixer ---
         if config.spatialize {
-            let mode = config.sourceMode
+            let mode = effectiveMode
             let spatialMax = max(playMax, ctx.captureBufSize, 4096)
             ctx.spatialBed = (mode == .ambienceBedStereo)
             ctx.spatialDualPoint = mode.isDualPoint
@@ -336,7 +377,9 @@ public final class SpatialEngine: @unchecked Sendable {
                 outputType: config.outputType.rawValue, outputTypeName: config.outputType.label,
                 hrtfMode: config.hrtfMode.rawValue, hrtfModeName: config.hrtfMode.label,
                 headTrack: config.headTracking ? 1 : 0,
-                inputSampleRate: captureRate, renderFlags: renderFlags, distanceParams: dp,
+                inputSampleRate: captureRate,
+                outputSampleRate: unifiedTap ? captureRate : 48_000,
+                renderFlags: renderFlags, distanceParams: dp,
                 attenCurve: config.attenuationCurve.rawValue,
                 reverbEnabled: reverbActive, reverbRoomType: config.reverbRoomType.rawValue) else {
                 teardown(); throw SpatialEngineError.setupFailed("spatial mixer")
@@ -361,21 +404,32 @@ public final class SpatialEngine: @unchecked Sendable {
             }
             ctx.spatialMaxFrames = spatialMax
             ctx.spatialMixer = mixer
-            applySourceParams(mixer: mixer)
-            applyReverbParams(mixer: mixer)
+            applySourceParams(mixer: mixer, mode: mode)
+            applyReverbParams(mixer: mixer, mode: mode)
             ctx.spatialize = true   // publish last
         }
 
         if unifiedTap {
             ctx.unifiedDeviceID = captureID
+            activeUnifiedDeviceID.store(UInt32(captureID), ordering: .releasing)
             var proc: AudioDeviceIOProcID?
             guard check(AudioDeviceCreateIOProcID(captureID, unifiedTapCallback, ctxPtr, &proc), "unified CreateIOProc"),
                   let proc else { teardown(); throw SpatialEngineError.setupFailed("unified IOProc") }
             ctx.unifiedIOProc = proc
+            if ctx.unifiedLayout.totalInputStreams > 0 {
+                _ = check(setIOProcStreamUsage(
+                    captureID,
+                    proc: proc,
+                    scope: kAudioObjectPropertyScopeInput,
+                    enabledStreams: Set(ctx.unifiedLayout.enabledInputStreams),
+                    totalStreams: ctx.unifiedLayout.totalInputStreams
+                ), "unified Input IOProcStreamUsage")
+            }
             guard check(AudioDeviceStart(captureID, proc), "unified Start") else {
                 teardown(); throw SpatialEngineError.setupFailed("unified start")
             }
-            installSampleRateListener(captureID)
+            let token = sessionToken.wrappingAdd(1, ordering: .releasing).newValue
+            installFormatListeners(captureID: captureID, outputID: outID, rate: captureRate, token: token)
             isRunning = true
             return
         }
@@ -405,7 +459,8 @@ public final class SpatialEngine: @unchecked Sendable {
               check(AudioOutputUnitStart(playbackUnit), "playbackUnit Start") else {
             teardown(); throw SpatialEngineError.setupFailed("unit start")
         }
-        installSampleRateListener(captureID)
+        let token = sessionToken.wrappingAdd(1, ordering: .releasing).newValue
+        installFormatListeners(captureID: captureID, outputID: outID, rate: captureRate, token: token)
         isRunning = true
     }
 
@@ -413,6 +468,23 @@ public final class SpatialEngine: @unchecked Sendable {
         guard isRunning else { return }
         teardown()
         isRunning = false
+    }
+
+    private func resolveUnifiedOutput(requested: AudioDeviceID?, aggregateID: AudioDeviceID) throws -> AudioDeviceID {
+        let mainID = aggregateMainSubDeviceUID(aggregateID).flatMap { deviceID(forUID: $0) }
+        if let r = requested, r != AudioDeviceID(kAudioObjectUnknown) {
+            if let mainID, r != mainID {
+                throw SpatialEngineError.setupFailed("requested outputDeviceID (\(r)) does not match tap aggregate main subdevice (\(mainID))")
+            }
+            guard r != aggregateID, deviceHasChannels(r, scope: kAudioObjectPropertyScopeOutput) else {
+                throw SpatialEngineError.noOutputDevice
+            }
+            return r
+        }
+        if let mainID, mainID != aggregateID, deviceHasChannels(mainID, scope: kAudioObjectPropertyScopeOutput) {
+            return mainID
+        }
+        return try resolveOutput(requested: nil, atmosID: aggregateID)
     }
 
     private func resolveOutput(requested: AudioDeviceID?, atmosID: AudioDeviceID) throws -> AudioDeviceID {
@@ -425,7 +497,9 @@ public final class SpatialEngine: @unchecked Sendable {
     }
 
     private func teardown() {
-        removeSampleRateListener()
+        _ = sessionToken.wrappingAdd(1, ordering: .releasing)
+        removeFormatListeners()
+        activeUnifiedDeviceID.store(UInt32(kAudioObjectUnknown), ordering: .releasing)
         guard let ctx else { return }
         if let proc = ctx.unifiedIOProc { AudioDeviceStop(ctx.unifiedDeviceID, proc) }
         if let c = ctx.captureUnit { AudioOutputUnitStop(c) }
@@ -455,62 +529,51 @@ public final class SpatialEngine: @unchecked Sendable {
         self.ctx = nil
     }
 
-    // MARK: Capture-rate change listener
+    // MARK: Format-change listeners
 
-    private func installSampleRateListener(_ device: AudioDeviceID) {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            DispatchQueue.main.async { self?.handleFormatChange() }
+    private func installFormatListeners(captureID: AudioDeviceID, outputID: AudioDeviceID, rate captureRate: Double, token: UInt64) {
+        let initialOutRate = deviceNominalSampleRate(outputID)
+        let initialCapIn = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeInput)
+        let initialCapOut = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeOutput)
+        let initialOut = deviceStreamChannelCounts(outputID, scope: kAudioObjectPropertyScopeOutput)
+
+        let notifyIfChanged: @Sendable () -> Void = { [weak self] in
+            guard let self, self.sessionToken.load(ordering: .acquiring) == token else { return }
+            let capRate = deviceNominalSampleRate(captureID)
+            let outRate = deviceNominalSampleRate(outputID)
+            let capRateChanged = (capRate != nil && abs(capRate! - captureRate) >= 0.5)
+            let outRateChanged = (initialOutRate != nil && outRate != nil && abs(outRate! - initialOutRate!) >= 0.5)
+            let layoutChanged = deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeInput) != initialCapIn
+                || deviceStreamChannelCounts(captureID, scope: kAudioObjectPropertyScopeOutput) != initialCapOut
+                || deviceStreamChannelCounts(outputID, scope: kAudioObjectPropertyScopeOutput) != initialOut
+            guard capRateChanged || outRateChanged || layoutChanged else { return }
+            self.onFormatChange?()
         }
-        if AudioObjectAddPropertyListenerBlock(device, &addr, DispatchQueue.main, block) == noErr {
-            rateListenerDevice = device
-            rateListenerBlock = block
-        }
-    }
 
-    private func removeSampleRateListener() {
-        guard let block = rateListenerBlock, rateListenerDevice != AudioDeviceID(kAudioObjectUnknown) else { return }
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        AudioObjectRemovePropertyListenerBlock(rateListenerDevice, &addr, DispatchQueue.main, block)
-        rateListenerBlock = nil
-        rateListenerDevice = AudioDeviceID(kAudioObjectUnknown)
-    }
+        let block: AudioObjectPropertyListenerBlock = { _, _ in notifyIfChanged() }
 
-    /// The capture device renegotiated its nominal rate (e.g. AirPods on mic use):
-    /// rebuild the graph at the new rate, then notify observers.
-    private func handleFormatChange() {
-        guard isRunning else { return }
-        controlQueue.async { [weak self] in
-            guard let self, self.isRunning else { return }
-            self.attemptFormatRebuild(retriesLeft: 1)
-        }
-    }
-
-    /// Rebuild the graph at the current device rate. On failure retry once after a short
-    /// delay (the device is often still mid-reconfigure on the first attempt); if it still
-    /// fails the engine is left stopped and `onFormatChange(false)` fires so the owner can
-    /// power down — the engine must never strand the system in tap-muted silence silently.
-    private func attemptFormatRebuild(retriesLeft: Int) {
-        let out = outputDeviceID
-        let cap = startedCaptureID
-        stop()
-        do {
-            try start(outputDeviceID: out, captureDeviceID: cap)
-            DispatchQueue.main.async { [weak self] in self?.onFormatChange?(true) }
-        } catch {
-            selog("format-change rebuild failed: \(error)")
-            if retriesLeft > 0 {
-                controlQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    self?.attemptFormatRebuild(retriesLeft: retriesLeft - 1)
-                }
-            } else {
-                DispatchQueue.main.async { [weak self] in self?.onFormatChange?(false) }
+        func add(_ device: AudioDeviceID, selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope) {
+            guard device != AudioDeviceID(kAudioObjectUnknown) else { return }
+            var addr = AudioObjectPropertyAddress(
+                mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+            if AudioObjectAddPropertyListenerBlock(device, &addr, DispatchQueue.main, block) == noErr {
+                formatListeners.append((device, addr, block))
             }
         }
+
+        for dev in Set([captureID, outputID]) {
+            add(dev, selector: kAudioDevicePropertyNominalSampleRate, scope: kAudioObjectPropertyScopeGlobal)
+            add(dev, selector: kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeOutput)
+        }
+        add(captureID, selector: kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeInput)
+    }
+
+    private func removeFormatListeners() {
+        for (device, addr, block) in formatListeners {
+            var a = addr
+            AudioObjectRemovePropertyListenerBlock(device, &a, DispatchQueue.main, block)
+        }
+        formatListeners.removeAll()
     }
 
     // MARK: Live state + params
@@ -563,7 +626,7 @@ public final class SpatialEngine: @unchecked Sendable {
         if let d = distance { config.distance = min(max(d, 0.35), config.distanceMax) }
         if let g = gain { config.gain = g }
         if let w = width { config.stereoWidth = w }
-        if let mixer = ctx?.spatialMixer { applySourceParams(mixer: mixer) }
+        if let mixer = ctx?.spatialMixer { applySourceParams(mixer: mixer, mode: activeSourceMode) }
     }
 
     /// Live-update the internal reverb wet/dry blend + gain (no-op unless the reverb
@@ -571,18 +634,18 @@ public final class SpatialEngine: @unchecked Sendable {
     public func updateReverb(blend: Float? = nil, gain: Float? = nil) {
         if let b = blend { config.reverbBlend = b }
         if let g = gain { config.globalReverbGain = g }
-        if let mixer = ctx?.spatialMixer { applyReverbParams(mixer: mixer) }
+        if let mixer = ctx?.spatialMixer { applyReverbParams(mixer: mixer, mode: activeSourceMode) }
     }
 
     /// The internal reverb wet path only renders under HRTF/HRTF-HQ; under
     /// Use Output Type it is inert and ReverbBlend would only attenuate the dry path.
     private var reverbActive: Bool { config.reverbEnabled && config.algorithm != .useOutputType }
 
-    private func applySourceParams(mixer: AudioUnit) {
+    private func applySourceParams(mixer: AudioUnit, mode: SourceRenderMode) {
         // Below ~0.2 m the UseOutputType renderer collapses the stereo image back into
         // the head; clamp at the engine boundary so no caller can drive it there.
         let dist = min(max(config.distance, 0.35), config.distanceMax)
-        if config.sourceMode.isDualPoint {
+        if mode.isDualPoint {
             // Two virtual speakers: bus 0 = L (az − spread), bus 1 = R (az + spread);
             // config.azimuth rotates the whole stage. el/distance/gain shared.
             let spread = config.stereoWidth
@@ -593,7 +656,7 @@ public final class SpatialEngine: @unchecked Sendable {
                 AudioUnitSetParameter(mixer, kParamDistance,  kAudioUnitScope_Input, e, AudioUnitParameterValue(dist), 0)
                 AudioUnitSetParameter(mixer, kParamGain,      kAudioUnitScope_Input, e, AudioUnitParameterValue(config.gain), 0)
             }
-        } else if config.sourceMode.isSurround {
+        } else if mode.isSurround {
             // 11 virtual speakers at canonical 7.1.4 angles + 1 bypassed LFE (bus 3).
             // config.azimuth/elevation rotate the whole stage; distance/gain shared.
             var b = 0
@@ -615,12 +678,12 @@ public final class SpatialEngine: @unchecked Sendable {
         }
     }
 
-    private func applyReverbParams(mixer: AudioUnit) {
+    private func applyReverbParams(mixer: AudioUnit, mode: SourceRenderMode) {
         guard reverbActive else { return }
         let buses: [AudioUnitElement]
-        if config.sourceMode.isDualPoint {
+        if mode.isDualPoint {
             buses = [0, 1]
-        } else if config.sourceMode.isSurround {
+        } else if mode.isSurround {
             buses = (0..<kAtmos714Channels).filter { $0 != kAtmos714LFEChannel }.map { AudioUnitElement($0) }
         } else {
             buses = [0]
@@ -658,7 +721,10 @@ public final class SpatialEngine: @unchecked Sendable {
             try start(outputDeviceID: out, captureDeviceID: cap)
         } else {
             config = newConfig
-            if let mixer = ctx?.spatialMixer { applySourceParams(mixer: mixer); applyReverbParams(mixer: mixer) }
+            if let mixer = ctx?.spatialMixer {
+                applySourceParams(mixer: mixer, mode: activeSourceMode)
+                applyReverbParams(mixer: mixer, mode: activeSourceMode)
+            }
         }
     }
 }

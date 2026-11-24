@@ -25,8 +25,12 @@ enum CaptureMode: String, CaseIterable, Identifiable {
 final class EngineController {
     var isOn = false
     var isStarting = false
+    @ObservationIgnored private var isTerminating = false
     @ObservationIgnored private var stopRequested = false
-    private var audioQueue: DispatchQueue { engine.controlQueue }
+    @ObservationIgnored private var pendingDeviceChange = false
+    @ObservationIgnored private var pendingFormatChange = false
+    @ObservationIgnored private var formatRetryWorkItem: DispatchWorkItem?
+    @ObservationIgnored private let audioQueue = DispatchQueue(label: "dev.atmoscontrol.audio-control", qos: .userInitiated)
     var config = SpatialConfig()
     var lastError: String?
     var atmosPresent = false
@@ -105,25 +109,38 @@ final class EngineController {
     }
 
     /// Switch the user-facing capture choice (maps onto CaptureMode + SourceRenderMode).
-    /// Restarts the engine if it was running.
+    /// Restarts the engine atomically on the audio control queue if it was running.
     func setCaptureChoice(_ choice: CaptureChoice) {
-        guard choice != captureChoice else { return }
+        guard !isStarting, choice != captureChoice else { return }
+        cancelFormatRetry()
         permissionNeeded = false
         let wasOn = isOn
-        if wasOn { powerOff() }
+        let prevMode = captureMode
         switch choice {
         case .personalized:
             captureMode = .processTap
-            if config.sourceMode == .surround714 || config.sourceMode == .surroundBed714 { config.sourceMode = .dualPointStereo }
+            if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
+            if !wasOn {
+                let cur = SpatialEngine.currentDefaultOutput()
+                if cur.id != SpatialEngine.atmosControlDeviceID() { outputName = cur.name }
+            }
         case .virtualStereo:
             captureMode = .loopbackDriver
-            if config.sourceMode == .surround714 || config.sourceMode == .surroundBed714 { config.sourceMode = .dualPointStereo }
+            if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
         case .surround:
             captureMode = .loopbackDriver
             config.sourceMode = .surround714
         }
-        engine.config = config
-        if wasOn { powerOn() }
+        guard wasOn else { return }
+        if prevMode == captureMode && captureMode == .loopbackDriver {
+            applyConfig()
+            return
+        }
+        if captureMode == .processTap {
+            startTapMode(restoreLoopbackDefault: savedDefault)
+        } else {
+            startLoopbackMode()
+        }
     }
 
     /// The live controller. Production creates exactly one (the App's @State model); the
@@ -148,18 +165,11 @@ final class EngineController {
         deviceMonitor.onChange = { [weak self] in self?.handleDeviceChange() }
         deviceMonitor.start()
 
-        // The capture device renegotiated its sample rate and the engine rebuilt the graph.
-        // ok == false means the rebuild failed and the engine is stopped: we MUST power off
-        // so the muting process tap is torn down (otherwise all system audio stays silenced).
-        engine.onFormatChange = { [weak self] ok in
-            guard let self else { return }
-            if ok {
-                self.lastError = nil
-                self.updateActivity()
-            } else {
-                self.lastError = "Audio format changed and the engine could not restart — stopped."
-                self.powerOff()
-            }
+        // The capture or output device changed sample rate or stream layout (e.g. AirPods
+        // A2DP ↔ HFP call profile). Route the rebuild through performAudioChange so one owner
+        // serializes all engine lifecycle operations.
+        engine.onFormatChange = { [weak self] in
+            MainActor.assumeIsolated { self?.handleFormatChange() }
         }
     }
 
@@ -176,30 +186,49 @@ final class EngineController {
     }
 
     /// Sensible output-type default for a sink (used on power-on and device switch).
-    private func outputType(for dev: AudioOutputDevice) -> OutputType {
+    private nonisolated static func defaultOutputType(for dev: AudioOutputDevice) -> OutputType {
         if dev.isAirPods { return .headphones }
         return dev.name.localizedCaseInsensitiveContains("headphone") ? .headphones : .builtInSpeakers
     }
 
-    /// Pick which real sink to route through. nil = follow the system default.
-    /// Swaps the playback graph live when running (atmos-control stays the default).
-    func selectOutput(_ dev: AudioOutputDevice?) {
-        selectedOutputID = dev?.id
-        if let d = dev { outputName = d.name; config.outputType = outputType(for: d) }
-        guard isOn else { engine.config = config; return }
-        if captureMode == .processTap { powerOff(); powerOn(); return }
-        engine.stop()
-        engine.config = config
-        do { try engine.start(outputDeviceID: dev?.id, captureDeviceID: activeCaptureID); activeSinkID = dev?.id; lastError = nil }
-        catch { lastError = "\(error)"; powerOff() }
+    private func outputType(for dev: AudioOutputDevice) -> OutputType {
+        Self.defaultOutputType(for: dev)
     }
 
-    // MARK: Device hot-swap
+    /// Pick which real sink to route through (loopback modes only; nil = follow the system default).
+    /// Personalized tap mode always follows the system default output so apps are not silenced.
+    func selectOutput(_ dev: AudioOutputDevice?) {
+        guard captureMode == .loopbackDriver else { return }
+        selectedOutputID = dev?.id
+        if let d = dev { outputName = d.name; config.outputType = outputType(for: d) }
+        guard isOn, !isStarting else { return }
+        let engine = self.engine, snapshot = config, targetID = dev?.id
+        performAudioChange({
+            engine.stop()
+            engine.config = snapshot
+            try engine.start(outputDeviceID: targetID, captureDeviceID: nil)
+            return targetID
+        }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let sinkID):
+                self.activeSinkID = sinkID
+                self.lastError = nil
+                self.updateActivity()
+            case .failure(let error):
+                self.lastError = "\(error)"
+                self.powerOff()
+            }
+        }
+    }
+
+    // MARK: Device hot-swap & format changes
 
     /// CoreAudio device list or default-output changed. Keep the picker fresh and,
-    /// if running, fail over when our real sink has vanished (e.g. AirPods unplugged).
+    /// if running, rebuild on default-output changes (Personalized) or fail over when
+    /// our real sink has vanished (Loopback).
     private func handleDeviceChange() {
-        guard !isStarting else { return }
+        if isStarting { pendingDeviceChange = true; return }
         guard !handlingChange else { return }
         handlingChange = true
         defer { handlingChange = false }
@@ -215,32 +244,124 @@ final class EngineController {
             if cur.id != SpatialEngine.atmosControlDeviceID() { outputName = cur.name }
             return
         }
+        if captureMode == .processTap {
+            let cur = SpatialEngine.currentDefaultOutput()
+            guard let next = devices.first(where: { $0.id == cur.id }) else {
+                lastError = "Output device disconnected — engine stopped."
+                powerOff()
+                return
+            }
+            if next.id != activeSinkID {
+                cancelFormatRetry()
+                startTapMode()
+            }
+            return
+        }
         if let sink = activeSinkID, !devices.contains(where: { $0.id == sink }) {
             recoverFromLostSink(devices)
         }
     }
 
-    /// Our render sink disappeared mid-session — fail over to another real device if one
-    /// exists (atmos-control stays the capture default), else power down safely.
+    /// Our render sink disappeared mid-session in loopback mode — fail over to another real
+    /// device if one exists (atmos-control stays the capture default), else power down safely.
     private func recoverFromLostSink(_ devices: [AudioOutputDevice]) {
-        if captureMode == .processTap { selectedOutputID = nil; powerOff(); powerOn(); return }
         selectedOutputID = nil
         guard let fallback = devices.first(where: { $0.isAirPods }) ?? devices.first(where: { !$0.isAirPods }) ?? devices.first else {
             lastError = "Output device disconnected — engine stopped."
             powerOff()
             return
         }
-        engine.stop()
         config.outputType = outputType(for: fallback)
-        engine.config = config
-        do {
-            try engine.start(outputDeviceID: fallback.id, captureDeviceID: activeCaptureID)
-            activeSinkID = fallback.id
-            outputName = fallback.name
-            lastError = "Output changed — now routing to \(fallback.name)."
-            updateActivity()
-        } catch {
-            lastError = "Output device lost — \(error)"
+        let engine = self.engine, snapshot = config
+        performAudioChange({
+            engine.stop()
+            engine.config = snapshot
+            try engine.start(outputDeviceID: fallback.id, captureDeviceID: nil)
+            return fallback
+        }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let dev):
+                self.activeSinkID = dev.id
+                self.outputName = dev.name
+                self.lastError = "Output changed — now routing to \(dev.name)."
+                self.updateActivity()
+            case .failure(let error):
+                self.lastError = "Output device lost — \(error)"
+                self.powerOff()
+            }
+        }
+    }
+
+    private func handleFormatChange() {
+        guard isOn else { return }
+        if isStarting { pendingFormatChange = true; return }
+        cancelFormatRetry()
+        rebuildForFormatChange(retriesLeft: 1)
+    }
+
+    private func cancelFormatRetry() {
+        formatRetryWorkItem?.cancel()
+        formatRetryWorkItem = nil
+    }
+
+    /// Rebuild the graph at the new device sample rate / stream layout through performAudioChange.
+    /// On failure, retry once after 0.3s (Bluetooth profile transitions are often mid-reconfigure
+    /// on the first notification); if the retry also fails, power off cleanly so apps are never
+    /// stranded in tap-muted silence.
+    private func rebuildForFormatChange(retriesLeft: Int) {
+        guard isOn else { return }
+        if isStarting { pendingFormatChange = true; return }
+        if captureMode == .processTap {
+            if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
+            let engine = self.engine, tap = self.tap, baseConfig = config
+            performAudioChange({
+                try Self.startTapSession(engine: engine, tap: tap, baseConfig: baseConfig)
+            }) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let (aggregate, dev, resolvedOutputType, devices)):
+                    self.outputs = devices
+                    self.config.outputType = resolvedOutputType
+                    self.activeCaptureID = aggregate
+                    self.activeSinkID = dev.id
+                    self.outputName = dev.name
+                    self.lastError = nil
+                    self.updateActivity()
+                case .failure:
+                    self.handleFormatRebuildFailure(retriesLeft: retriesLeft)
+                }
+            }
+        } else {
+            let engine = self.engine, snapshot = config, sink = activeSinkID
+            performAudioChange({
+                engine.stop()
+                engine.config = snapshot
+                try engine.start(outputDeviceID: sink, captureDeviceID: nil)
+            }) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.lastError = nil
+                    self.updateActivity()
+                case .failure:
+                    self.handleFormatRebuildFailure(retriesLeft: retriesLeft)
+                }
+            }
+        }
+    }
+
+    private func handleFormatRebuildFailure(retriesLeft: Int) {
+        if retriesLeft > 0, isOn, !stopRequested {
+            let item = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.formatRetryWorkItem = nil
+                self.rebuildForFormatChange(retriesLeft: retriesLeft - 1)
+            }
+            formatRetryWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+        } else {
+            lastError = "Audio format changed and the engine could not restart — stopped."
             powerOff()
         }
     }
@@ -339,41 +460,64 @@ final class EngineController {
         if !isOn { powerOn() }
     }
 
-    /// Personalized capture via a muting process tap. AirPods stay the default output so
-    /// property 3116 engages; we never hijack the default → no black-hole, nothing to restore.
-    private func startTapMode() {
+    /// Shared audioQueue helper for starting or rebuilding a device-scoped process-tap session.
+    private nonisolated static func startTapSession(
+        engine: SpatialEngine,
+        tap: ProcessTap,
+        baseConfig: SpatialConfig,
+        restoreLoopbackDefault: AudioDeviceID? = nil
+    ) throws -> (AudioDeviceID, AudioOutputDevice, OutputType, [AudioOutputDevice]) {
+        engine.stop()
+        if tap.isActive { tap.stop() }
+        if let prevDefault = restoreLoopbackDefault {
+            restoreSafeDefault(savedDefault: prevDefault, engine: engine)
+        }
         let devices = engine.outputDevices()
-        outputs = devices
         let current = SpatialEngine.currentDefaultOutput()
-        // Render to the current default (where 3116 keys) unless the user picked a sink.
-        let real: AudioOutputDevice?
-        if let sel = selectedOutputID, let d = devices.first(where: { $0.id == sel }) { real = d }
-        else { real = devices.first(where: { $0.id == current.id }) ?? devices.first(where: { $0.isAirPods }) }
+        guard let real = devices.first(where: { $0.id == current.id }) else {
+            throw SpatialEngineError.noOutputDevice
+        }
+        var snapshot = baseConfig
+        snapshot.outputType = defaultOutputType(for: real)
+        do {
+            let aggregate = try tap.start(muted: true, outputDeviceID: real.id)
+            engine.config = snapshot
+            try engine.start(outputDeviceID: real.id, captureDeviceID: aggregate)
+            return (aggregate, real, snapshot.outputType, devices)
+        } catch {
+            engine.stop()
+            if tap.isActive { tap.stop() }
+            throw error
+        }
+    }
 
-        if let r = real { config.outputType = outputType(for: r); outputName = r.name }
-        let engine = self.engine, tap = self.tap, snapshot = config
+    /// Personalized capture via a muting process tap. Always follows the system default
+    /// output so apps play into the tapped sink and property 3116 stays engaged.
+    private func startTapMode(restoreLoopbackDefault: AudioDeviceID? = nil) {
+        if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
+        let engine = self.engine, tap = self.tap, baseConfig = config
         performAudioChange({
-            do {
-                let aggregate = try tap.start(muted: true, outputDeviceID: real?.id)
-                engine.config = snapshot
-                try engine.start(outputDeviceID: real?.id, captureDeviceID: aggregate)
-                return aggregate
-            } catch {
-                engine.stop(); tap.stop()
-                throw error
-            }
+            try Self.startTapSession(
+                engine: engine, tap: tap, baseConfig: baseConfig,
+                restoreLoopbackDefault: restoreLoopbackDefault)
         }) { [weak self] result in
             guard let self else { return }
             switch result {
-            case .success(let aggregate):
+            case .success(let (aggregate, real, resolvedOutputType, devices)):
+                self.outputs = devices
+                self.config.outputType = resolvedOutputType
+                self.outputName = real.name
                 self.activeCaptureID = aggregate
-                self.activeSinkID = real?.id
+                self.activeSinkID = real.id
                 self.savedDefault = nil
                 self.isOn = true
                 self.lastError = nil
                 self.permissionNeeded = false
                 self.updateActivity()
             case .failure(let error):
+                self.savedDefault = nil
+                self.isOn = false
+                self.resetLiveTelemetry()
                 if let e = error as? ProcessTapError, case .createTapFailed = e {
                     self.permissionNeeded = true
                     self.lastError = nil
@@ -385,8 +529,8 @@ final class EngineController {
         }
     }
 
-    // Keep blocking Core Audio registration off the UI thread.
-    // isStarting excludes overlapping UI requests.
+    // Serialize all engine/tap lifecycle mutations off the UI thread.
+    // isStarting excludes overlapping UI requests; device/format changes queue cleanly.
     private func performAudioChange<T: Sendable>(
         _ operation: @escaping @Sendable () throws -> T,
         completion: @escaping @MainActor @Sendable (Result<T, Error>) -> Void
@@ -401,8 +545,25 @@ final class EngineController {
                 guard let self else { return }
                 self.isStarting = false
                 completion(result)
-                if self.stopRequested { self.stopRequested = false; self.powerOff() }
+                self.drainPendingEvents()
             }
+        }
+    }
+
+    private func drainPendingEvents() {
+        guard !isStarting, !isTerminating else { return }
+        if stopRequested {
+            stopRequested = false
+            pendingDeviceChange = false
+            pendingFormatChange = false
+            powerOff()
+        } else if pendingDeviceChange {
+            pendingDeviceChange = false
+            pendingFormatChange = false
+            handleDeviceChange()
+        } else if pendingFormatChange {
+            pendingFormatChange = false
+            handleFormatChange()
         }
     }
 
@@ -411,10 +572,14 @@ final class EngineController {
     private func startLoopbackMode() {
         guard let atmos = SpatialEngine.atmosControlDeviceID() else {
             lastError = "atmos-control device not found — install the HAL driver, or use Personalized (tap) mode."
+            if isOn || tap.isActive { powerOff() }
             return
         }
         let current = SpatialEngine.currentDefaultOutput()
-        savedDefault = current.id
+        let prevDefault = savedDefault ?? current.id
+        // Record savedDefault before dispatching so shutdownForTermination can restore it
+        // even if termination arrives while startLoopbackMode is still in flight.
+        savedDefault = prevDefault
         let devices = engine.outputDevices()
         outputs = devices
         let real: AudioOutputDevice?
@@ -426,31 +591,42 @@ final class EngineController {
             real = devices.first(where: { $0.id == current.id })
         }
         if let r = real { config.outputType = outputType(for: r); outputName = r.name }
-        engine.config = config
+        let engine = self.engine, tap = self.tap, snapshot = config
+        let sinkID = real?.id ?? (current.id != atmos ? current.id : nil)
 
-        SpatialEngine.setDefaultOutput(atmos)
-        do {
-            try engine.start(outputDeviceID: real?.id, captureDeviceID: nil)
-            activeCaptureID = nil
-            activeSinkID = real?.id ?? (current.id != atmos ? current.id : nil)
-            isOn = true
-            lastError = nil
-            updateActivity()
-        } catch {
-            lastError = "\(error)"
-            restoreSafeDefault()   // never leave the system default on the virtual sink
+        performAudioChange({
+            engine.stop()
+            if tap.isActive { tap.stop() }
+            SpatialEngine.setDefaultOutput(atmos)
+            engine.config = snapshot
+            do {
+                try engine.start(outputDeviceID: real?.id, captureDeviceID: nil)
+                return sinkID
+            } catch {
+                engine.stop()
+                Self.restoreSafeDefault(savedDefault: prevDefault, engine: engine)
+                throw error
+            }
+        }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let activeSink):
+                self.savedDefault = prevDefault
+                self.activeCaptureID = nil
+                self.activeSinkID = activeSink
+                self.isOn = true
+                self.lastError = nil
+                self.updateActivity()
+            case .failure(let error):
+                self.savedDefault = nil
+                self.isOn = false
+                self.resetLiveTelemetry()
+                self.lastError = "\(error)"
+            }
         }
     }
 
-    func powerOff() {
-        if isStarting { stopRequested = true; return }
-        engine.stop()
-        if tap.isActive { tap.stop() }
-        // Restore the system default ONLY if loopback mode actually hijacked it (savedDefault
-        // set). Idle/tap quit (no hijack) must NOT touch routing — otherwise the terminate hook
-        // would yank the user's output to speakers on every quit even if we never powered on.
-        if activeCaptureID == nil && savedDefault != nil { restoreSafeDefault() } else { savedDefault = nil }
-        isOn = false
+    private func resetLiveTelemetry() {
         activeSinkID = nil
         activeCaptureID = nil
         personalizedHRTFEngaged = false
@@ -460,17 +636,71 @@ final class EngineController {
         updateActivity()
     }
 
-    /// Switch the capture path (restarts the engine if running).
+    func powerOff() {
+        cancelFormatRetry()
+        if isStarting {
+            stopRequested = true
+            pendingDeviceChange = false
+            pendingFormatChange = false
+            return
+        }
+        let restoreDefault = savedDefault
+        let needsTeardown = isOn || tap.isActive || restoreDefault != nil
+        isOn = false
+        savedDefault = nil
+        resetLiveTelemetry()
+        guard needsTeardown else { return }
+        let engine = self.engine, tap = self.tap
+        performAudioChange({
+            engine.stop()
+            if tap.isActive { tap.stop() }
+            if let restoreDefault {
+                Self.restoreSafeDefault(savedDefault: restoreDefault, engine: engine)
+            }
+        }) { _ in }
+    }
+
+    /// Synchronous teardown for applicationWillTerminate so the process never exits before
+    /// destroying the tap/aggregate or restoring the loopback default. Pumps the main run loop
+    /// briefly if an audioQueue transition is in flight so HAL registration cannot deadlock.
+    func shutdownForTermination() {
+        isTerminating = true
+        cancelFormatRetry()
+        if isStarting {
+            stopRequested = true
+            let deadline = Date(timeIntervalSinceNow: 2.0)
+            while isStarting && Date() < deadline {
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+            }
+        }
+        let restoreDefault = savedDefault
+        let engine = self.engine, tap = self.tap
+        if !isStarting {
+            audioQueue.sync {
+                engine.stop()
+                if tap.isActive { tap.stop() }
+                if let restoreDefault {
+                    Self.restoreSafeDefault(savedDefault: restoreDefault, engine: engine)
+                }
+            }
+        } else if let restoreDefault {
+            Self.restoreSafeDefault(savedDefault: restoreDefault, engine: engine)
+        }
+        isOn = false
+        savedDefault = nil
+        resetLiveTelemetry()
+    }
+
+    /// Switch the capture path (restarts atomically if running).
     func setCaptureMode(_ m: CaptureMode) {
-        guard captureMode != m else { return }
-        captureMode = m
-        if isOn { powerOff(); powerOn() }
+        guard !isStarting, captureMode != m else { return }
+        setCaptureChoice(m == .processTap ? .personalized : (config.sourceMode.isSurroundMode ? .surround : .virtualStereo))
     }
 
     /// Restore the system default to a present, real (non-virtual) device. Prefers the
     /// saved pre-power-on default; falls back to built-in speakers / any real sink so we
     /// never strand the default on the atmos-control loopback (which black-holes audio).
-    private func restoreSafeDefault() {
+    private nonisolated static func restoreSafeDefault(savedDefault: AudioDeviceID?, engine: SpatialEngine) {
         let atmos = SpatialEngine.atmosControlDeviceID()
         let present = engine.outputDevices()
         if let s = savedDefault, s != atmos, present.contains(where: { $0.id == s }) {
@@ -479,7 +709,6 @@ final class EngineController {
                     ?? present.first(where: { !$0.isAirPods }) ?? present.first {
             SpatialEngine.setDefaultOutput(speakers.id)
         }
-        savedDefault = nil
     }
 
     // MARK: Config changes
@@ -487,21 +716,18 @@ final class EngineController {
     /// Apply a rebuild-class config change (output type, HRTF, algorithm, source mode,
     /// head tracking). Brief audio gap while running.
     func applyConfig() {
-        guard !isStarting else { return }
-        guard isOn else { engine.config = config; return }
-        if captureMode == .processTap {
-            let engine = self.engine, snapshot = config
-            performAudioChange({ try engine.reconfigure(snapshot) }) { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .success: self.updateActivity()
-                case .failure(let error): self.lastError = "\(error)"; self.powerOff()
-                }
-            }
-            return
+        if captureMode == .processTap && config.sourceMode.isSurroundMode {
+            config.sourceMode = .dualPointStereo
         }
-        do { try engine.reconfigure(config); updateActivity() }
-        catch { lastError = "\(error)"; powerOff() }
+        guard !isStarting, isOn else { return }
+        let engine = self.engine, snapshot = config
+        performAudioChange({ try engine.reconfigure(snapshot) }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success: self.updateActivity()
+            case .failure(let error): self.lastError = "\(error)"; self.powerOff()
+            }
+        }
     }
 
     /// Live source position/gain/width (no rebuild).
@@ -512,6 +738,7 @@ final class EngineController {
         if let d = distance { config.distance = d }
         if let g = gain { config.gain = g }
         if let w = width { config.stereoWidth = w }
+        guard !isStarting, isOn, formatRetryWorkItem == nil else { return }
         engine.updateSource(azimuth: azimuth, elevation: elevation, distance: distance, gain: gain, width: width)
     }
 
@@ -519,6 +746,7 @@ final class EngineController {
     /// active, i.e. HRTF / HRTF-HQ).
     func setReverbBlend(_ v: Float) {
         config.reverbBlend = v
+        guard !isStarting, isOn, formatRetryWorkItem == nil else { return }
         engine.updateReverb(blend: v)
     }
 
@@ -559,6 +787,7 @@ final class EngineController {
     private func stopPolling() { timer?.invalidate(); timer = nil }
 
     private func tick() {
+        guard !isStarting, isOn, formatRetryWorkItem == nil else { return }
         let s = engine.pollState()
         // Fan the poll struct out into individual tracked properties, each guarded against
         // no-op writes. ringFill/totalCaptured/totalPlayed change every tick during playback

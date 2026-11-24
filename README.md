@@ -41,13 +41,11 @@ reduces to one switch.
    and processing is local.
 
 The Personalized path uses a device-scoped tap and a private aggregate whose main
-subdevice is the physical output. Capture, spatialization, and playback run in one
-IOProc on that output's clock; the system default output stays unchanged.
-
-This path currently requires a 48 kHz stereo Float32 output for spatial rendering.
-44.1 kHz source material can play through a 48 kHz output, but other hardware output
-rates, microphone/call-profile transitions, and arbitrary duplex interfaces still
-need validation. The optional loopback-driver modes keep their existing audio path.
+subdevice is the system default output. Capture, spatialization, and playback run in one
+IOProc on that output's clock and native sample rate, without changing the system default
+output. Switching the default output or renegotiating a Bluetooth call profile rebuilds
+the graph automatically; unsupported multichannel output layouts fail cleanly at start.
+The optional loopback-driver modes keep their existing audio path.
 
 ## Capture modes
 

@@ -66,7 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Critical in loopback mode: otherwise the default is stranded on the virtual
         // atmos-control sink and all system audio black-holes until manually re-selected.
         // (terminate(_:) invokes this before exit, so the menu's Quit button is covered too.)
-        EngineController.shared?.powerOff()
+        EngineController.shared?.shutdownForTermination()
     }
 
     private func previewWindow<V: View>(_ root: V, title: String, x: CGFloat, fixedSize: NSSize? = nil) {
