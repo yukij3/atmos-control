@@ -17,7 +17,7 @@ pub enum MockPreset {
     /// Power just switched on, the engine still starting.
     Starting,
     /// A Personalized start blocked on the macOS audio-capture consent prompt (the engine's
-    /// `awaitingConsent`: "Waiting for audio-capture permission…", still busy).
+    /// `awaitingConsent`: "Awaiting capture permission…", still busy).
     AwaitingConsent,
     /// The tap start failed on audio-capture consent.
     PermissionNeeded,
@@ -186,7 +186,7 @@ impl MockEngine {
         }
         s.engine_status_text = match s.engine_status {
             EngineStatus::Off => "Off",
-            EngineStatus::Starting if self.awaiting_consent => "Waiting for audio-capture permission…",
+            EngineStatus::Starting if self.awaiting_consent => "Awaiting capture permission…",
             EngineStatus::Starting => "Starting…",
             EngineStatus::On => "On",
             EngineStatus::Stopping => "Stopping…",
@@ -328,7 +328,7 @@ impl MockEngine {
         }
         tel.total_captured = (t * 48_000.0) as u64;
         tel.total_played = tel.total_captured.saturating_sub(512);
-        tel.ring_fill = 512 + ((t * 31.0).sin() * 64.0) as i64 as u64;
+        tel.ring_fill = (512.0 + (t * 31.0).sin() * 64.0) as u64;
     }
 
     // ── Commands (same contracts as the C ABI's) ────────────────────────────────────────
@@ -386,13 +386,14 @@ impl MockEngine {
     }
 
     pub fn select_output(&mut self, selection: OutputSelection) {
-        if self.s.capture_choice == CaptureChoice::Personalized { return; }
+        // Ignored while busy, as the engine does (atmos_core.h).
+        if self.s.capture_choice == CaptureChoice::Personalized || self.s.busy { return; }
         self.s.selected_output = match selection {
             OutputSelection::FollowDefault => None,
             OutputSelection::Device(id) if self.device(id).is_some() => Some(id),
             OutputSelection::Device(_) => return,
         };
-        if self.s.is_on && !self.s.busy { self.rebuild(); }
+        if self.s.is_on { self.rebuild(); }
         self.derive();
         self.changed();
     }
@@ -516,10 +517,23 @@ mod tests {
         let mut m = MockEngine::new(MockPreset::AwaitingConsent);
         let s = m.snapshot();
         assert_eq!((s.engine_status, s.busy), (EngineStatus::Starting, true));
-        assert_eq!(s.engine_status_text, "Waiting for audio-capture permission…");
+        assert_eq!(s.engine_status_text, "Awaiting capture permission…");
         m.power_off();
         m.tick(1.0);
         assert_eq!(m.snapshot().engine_status_text, "Off");
+    }
+
+    #[test]
+    fn status_texts_fit_the_c_snapshot() {
+        // The real engine's texts (EngineController.engineStatusText, mirrored here) travel in
+        // char[ATMOS_STATUS_CAP] fields: longer ones arrive cut, and the panel then misses the
+        // "permission" it looks for in the waiting text.
+        for &preset in MockPreset::ALL {
+            let s = MockEngine::new(preset).snapshot().clone();
+            for text in [&s.engine_status_text, &s.hrtf.short, &s.head_track.text] {
+                assert!(text.len() < atmos_core_sys::ATMOS_STATUS_CAP, "{preset:?}: {text:?} is {} bytes", text.len());
+            }
+        }
     }
 
     #[test]

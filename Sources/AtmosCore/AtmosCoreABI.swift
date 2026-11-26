@@ -6,9 +6,10 @@
 //
 // Change notification: CoreHost watches every property the snapshot reads with Observation's
 // withObservationTracking. The first change in a main-queue turn bumps `generation` and
-// schedules one DispatchQueue.main.async block that re-arms the tracking and calls the UI's
-// change callback; so the callback never runs re-entrantly inside a command, and it only
-// runs at all if the main queue is serviced by the run loop the UI drives.
+// schedules one DispatchQueue.main.async block that re-arms the tracking, bumps `generation`
+// again (later changes in the window were untracked) and calls the UI's change callback; so
+// the callback never runs re-entrantly inside a command, and it only runs at all if the main
+// queue is serviced by the run loop the UI drives.
 
 import AtmosCoreABI
 import CoreAudio
@@ -75,6 +76,10 @@ final class CoreHost {
                 self.notifyScheduled = false
                 // Re-arm after this turn's mutations landed (onChange fires once, on willSet).
                 self.armTracking()
+                // Mutations after the first one in this window were untracked and did not
+                // bump `generation`; a snapshot the UI read in between (e.g. right after a
+                // command) carries the same number. Bump again so the UI re-reads now.
+                self.generation &+= 1
                 if self.log && !self.deliveredOnce {
                     self.deliveredOnce = true
                     FileHandle.standardError.write(Data("atmos-core: change notification delivered on the main queue\n".utf8))

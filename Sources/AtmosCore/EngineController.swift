@@ -166,7 +166,10 @@ final class EngineController {
         syncIdleOutput(outputs)
 
         motion.onYaw = { [weak self] y in
-            guard let self else { return }
+            // A sample already queued on the main queue can land after motion.stop(): don't
+            // let it mark the pose live while tracking is off (it would read "Tracking" at the
+            // next power-on before any real sample).
+            guard let self, self.isOn, self.config.headTracking else { return }
             if abs(y - self.headYaw) > 0.008 { self.headYaw = y }   // ~0.5°: limit redraw churn
             if !self.headPoseLive { self.headPoseLive = true }
         }
@@ -238,11 +241,21 @@ final class EngineController {
     /// Pick which real sink to route through (loopback modes only; nil = follow the system default).
     /// Personalized tap mode always follows the system default output so apps are not silenced.
     func selectOutput(_ dev: AudioOutputDevice?) {
-        guard captureMode == .loopbackDriver else { return }
+        // Restart-class like setCaptureChoice: a pick made while a lifecycle operation is in
+        // flight would show in the state but never reach the engine (atmos_core.h: ignored
+        // while busy).
+        guard captureMode == .loopbackDriver, !isStarting else { return }
         selectedOutputID = dev?.id
-        if let d = dev { outputName = d.name; syncOutputType(to: d) } else { syncIdleOutput(outputs) }
-        guard isOn, !isStarting else { return }
-        let engine = self.engine, snapshot = config, targetID = dev?.id
+        guard isOn else {
+            if let d = dev { outputName = d.name; syncOutputType(to: d) } else { syncIdleOutput(outputs) }
+            return
+        }
+        // Following the default while running: the system default is the loopback itself, so
+        // resolve the real device here. Passing nil would let the engine take the first
+        // output device, and a nil activeSinkID would disable lost-sink failover.
+        let target = dev ?? followDefaultSink(outputs)
+        if let t = target { outputName = t.name; syncOutputType(to: t) }
+        let engine = self.engine, snapshot = config, targetID = target?.id
         performAudioChange({
             engine.stop()
             engine.config = snapshot
@@ -260,6 +273,18 @@ final class EngineController {
                 self.powerOff()
             }
         }
+    }
+
+    /// The real device "follow the macOS default output" means in the loopback modes: the
+    /// default itself, or, while that is the loopback (hijacked by a running engine), the
+    /// device it was before power-on.
+    private func followDefaultSink(_ devices: [AudioOutputDevice]) -> AudioOutputDevice? {
+        let current = SpatialEngine.currentDefaultOutput().id
+        if current != SpatialEngine.atmosControlDeviceID(), let d = devices.first(where: { $0.id == current }) {
+            return d
+        }
+        if let s = savedDefault, let d = devices.first(where: { $0.id == s }) { return d }
+        return devices.first(where: { $0.isAirPods }) ?? devices.first
     }
 
     // MARK: Device hot-swap & format changes
@@ -620,8 +645,16 @@ final class EngineController {
             powerOff()
         } else if pendingDeviceChange {
             pendingDeviceChange = false
-            pendingFormatChange = false
             handleDeviceChange()
+            // A rebuild or teardown it started re-reads every format. If it started nothing
+            // (same device), a format change that arrived during the operation still needs its
+            // own rebuild: its CoreAudio notification already fired, nothing reports it again.
+            if isStarting {
+                pendingFormatChange = false
+            } else if pendingFormatChange {
+                pendingFormatChange = false
+                handleFormatChange()
+            }
         } else if pendingFormatChange {
             pendingFormatChange = false
             handleFormatChange()
@@ -934,10 +967,12 @@ final class EngineController {
         return isOn ? .on : .off
     }
 
+    /// At most 31 UTF-8 bytes (ATMOS_STATUS_CAP): longer text is cut in the snapshot, and the
+    /// panel looks for "permission" in the waiting text to offer Privacy & Security.
     var engineStatusText: String {
         switch engineStatus {
         case .off: return "Off"
-        case .starting: return awaitingConsent ? "Waiting for audio-capture permission…" : "Starting…"
+        case .starting: return awaitingConsent ? "Awaiting capture permission…" : "Starting…"
         case .on: return "On"
         case .stopping: return "Stopping…"
         }

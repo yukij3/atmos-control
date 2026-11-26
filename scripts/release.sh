@@ -81,19 +81,35 @@ SHORT="$(git rev-parse --short=12 HEAD)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 echo "    version $VERSION, commit $SHORT ($BRANCH)"
 
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists locally"
+# An existing tag is only accepted when it points at HEAD: that is a publish that failed after
+# tagging (push or gh release create), and a rerun picks it up instead of refusing forever.
+tag_commit() { git rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true; }
+TAG_LOCAL=0
+if [ -n "$(tag_commit)" ]; then
+    [ "$(tag_commit)" = "$COMMIT" ] || die "tag $TAG already exists locally, at a commit other than HEAD ($SHORT)"
+    TAG_LOCAL=1
+    warn "tag $TAG already exists at HEAD (an earlier publish stopped after tagging); reusing it"
+fi
 
+TAG_REMOTE=0
 if [ "$PUBLISH" = "1" ]; then
     command -v gh >/dev/null 2>&1 || die "'gh' not found (needed for --publish)"
     gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
-    git fetch --quiet origin main --tags
+    git fetch --quiet origin main
     git merge-base --is-ancestor HEAD origin/main \
         || die "HEAD ($SHORT) is not on origin/main; merge and push first"
-    git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 \
-        && die "tag $TAG already exists on origin"
+    # The peeled (^{}) line is the commit an annotated tag points at.
+    REMOTE_TAG="$(git ls-remote --tags origin "refs/tags/$TAG^{}" | cut -f1)"
+    if [ -n "$REMOTE_TAG" ] || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+        [ "$REMOTE_TAG" = "$COMMIT" ] && [ "$TAG_LOCAL" = "1" ] \
+            || die "tag $TAG already exists on origin and is not this build's tag at HEAD ($SHORT)"
+        TAG_REMOTE=1
+    fi
     ORIGIN_URL="$(git remote get-url origin)"
     GH_REPO="$(printf '%s\n' "$ORIGIN_URL" | sed -E 's#^(git@github\.com:|https://github\.com/|ssh://git@github\.com/)##; s#\.git$##')"
     [[ "$GH_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "cannot derive GitHub repo from origin '$ORIGIN_URL'"
+    gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1 \
+        && die "a GitHub release for $TAG already exists (a partial one? check, then: gh release delete $TAG --repo $GH_REPO)"
     echo "    publishing to $GH_REPO"
 else
     if git rev-parse -q --verify origin/main >/dev/null && ! git merge-base --is-ancestor HEAD origin/main; then
@@ -103,7 +119,11 @@ fi
 
 atmos_resolve_identity
 echo "    signing identity: $SIGN_NAME${SIGN_ARG:+ ($SIGN_ARG)}"
-[ "$SIGN_ARG" = "-" ] && warn "ad-hoc signature: TCC permissions will not carry over between releases"
+if [ "$SIGN_ARG" = "-" ]; then
+    # The notes promise a self-signed certificate whose TCC grants carry over to later releases.
+    [ "$PUBLISH" != "1" ] || die "refusing to publish an ad-hoc signed release (set SIGN_IDENTITY to the project certificate)"
+    warn "ad-hoc signature: TCC permissions will not carry over between releases"
+fi
 
 # ── Build ───────────────────────────────────────────────────────────────────
 info "Building the app"
@@ -172,6 +192,7 @@ shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2: keep '&' literal b
 NOTES="$(cat scripts/release/NOTES.md.in)"
 SIGNER="$SIGN_NAME"
 NOTES="${NOTES//@VERSION@/$VERSION}"
+if [ "$PRERELEASE" = "1" ]; then NOTES="${NOTES//@CHANNEL@/ (pre-release)}"; else NOTES="${NOTES//@CHANNEL@/}"; fi
 NOTES="${NOTES//@COMMIT@/$SHORT}"
 NOTES="${NOTES//@APP_ZIP@/$APP_ZIP}"
 NOTES="${NOTES//@DRIVER_ZIP@/$DRIVER_ZIP}"
@@ -195,17 +216,20 @@ fi
 [ -z "$(git status --porcelain)" ] || die "tree became dirty during the build; refusing to tag"
 TITLE="atmos-control $VERSION"
 info "About to publish"
-echo "    git tag -a $TAG $SHORT -m \"$TITLE\""
-echo "    git push origin $TAG"
+[ "$TAG_LOCAL" = "1" ] || echo "    git tag -a $TAG $SHORT -m \"$TITLE\""
+[ "$TAG_REMOTE" = "1" ] || echo "    git push origin $TAG"
 echo "    gh release create $TAG --repo $GH_REPO $([ "$PRERELEASE" = 1 ] && echo --prerelease) --title \"$TITLE\" --notes-file $OUT/NOTES.md"
 echo "        $OUT/$APP_ZIP $OUT/$DRIVER_ZIP $OUT/SHA256SUMS.txt"
 printf 'Type the version (%s) to continue: ' "$VERSION"
 read -r reply < /dev/tty
 [ "$reply" = "$VERSION" ] || die "cancelled"
 
-git tag -a "$TAG" "$COMMIT" -m "$TITLE"
-git push origin "refs/tags/$TAG"
+RERUN="rerun scripts/release.sh $VERSION --publish (it reuses the tag at HEAD)"
+[ "$TAG_LOCAL" = "1" ] || git tag -a "$TAG" "$COMMIT" -m "$TITLE"
+[ "$TAG_REMOTE" = "1" ] || git push origin "refs/tags/$TAG" \
+    || die "pushing $TAG failed; the tag exists locally only: fix the cause and $RERUN, or drop it: git tag -d $TAG"
 GH_ARGS=(release create "$TAG" --repo "$GH_REPO" --verify-tag --title "$TITLE" --notes-file "$OUT/NOTES.md")
 [ "$PRERELEASE" = "1" ] && GH_ARGS+=(--prerelease)
-gh "${GH_ARGS[@]}" "$OUT/$APP_ZIP" "$OUT/$DRIVER_ZIP" "$OUT/SHA256SUMS.txt"
+gh "${GH_ARGS[@]}" "$OUT/$APP_ZIP" "$OUT/$DRIVER_ZIP" "$OUT/SHA256SUMS.txt" \
+    || die "creating the GitHub release failed; $TAG is on origin. Delete any partial release (gh release delete $TAG --repo $GH_REPO), then $RERUN"
 info "Published $TAG"

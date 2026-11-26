@@ -13,6 +13,12 @@ use crate::geom::{arc_band, ellipse_path, thick_polyline};
 use crate::stage::{Emitter, Layer, RadarScale, SourceMode, Soundstage, range, wrap_degrees};
 use crate::theme::{Theme, ty};
 
+thread_local! {
+    /// The source position when the current radar drag began (one pointer, one drag at a
+    /// time), for the cancel edit to restore.
+    static DRAG_ORIGIN: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Where a radar drag or key press puts the source.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SourceEdit {
@@ -179,11 +185,22 @@ impl Radar {
             let on_drag = {
                 let f = f.clone();
                 move |s: &mut S, d: &mut Drag, tx: &mut Tx| {
+                    // The view rebuilds after each edit, so the handler that sees Move/Up is a
+                    // newer one whose az0/d0 are already dragged values: keep the press's.
                     let e = match d.phase {
-                        Phase::Down => edit(d.x, d.y, EditPhase::Begin),
+                        Phase::Down => {
+                            DRAG_ORIGIN.set(Some((az0, d0)));
+                            edit(d.x, d.y, EditPhase::Begin)
+                        }
                         Phase::Move => edit(d.x, d.y, EditPhase::Change),
-                        Phase::Up if d.cancelled() => SourceEdit { azimuth: az0, distance: d0, phase: EditPhase::Cancel },
-                        Phase::Up => edit(d.x, d.y, EditPhase::End),
+                        Phase::Up if d.cancelled() => {
+                            let (azimuth, distance) = DRAG_ORIGIN.take().unwrap_or((az0, d0));
+                            SourceEdit { azimuth, distance, phase: EditPhase::Cancel }
+                        }
+                        Phase::Up => {
+                            DRAG_ORIGIN.set(None);
+                            edit(d.x, d.y, EditPhase::End)
+                        }
                     };
                     f(s, e, tx);
                 }

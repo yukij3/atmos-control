@@ -14,13 +14,17 @@
 # Never sign with Apple-issued identities, not even as a fallback. The explicit entries
 # cover an identity that lives in this keychain but must not be used for this project.
 ATMOS_DENIED_IDENTITY_RE='Developer ID|Apple Development|Apple Distribution|Mac Developer|Mac App Distribution|3rd Party Mac|iPhone (Developer|Distribution)|Konstantin Arefev|5ZJZWZ4U22|5F931AB63C44157980A4DD3987EE661156E66B65'
+# macOS grep honours GREP_OPTIONS (e.g. -v would invert the deny-list checks).
+unset GREP_OPTIONS
 
 atmos_die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 atmos_default_version() {
     local repo tag
     repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    tag="$(git -C "$repo" describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || true)"
+    # Plain vX.Y.Z only: a pre-release tag (v1.3.0-rc1) would fail the X.Y.Z check below and
+    # break every build script.
+    tag="$(git -C "$repo" describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-*' 2>/dev/null || true)"
     if [ -n "$tag" ]; then printf '%s\n' "${tag#v}"; else printf '0.0.0\n'; fi
 }
 
@@ -47,10 +51,14 @@ atmos_resolve_identity() {
     fi
     # Not -v: a self-signed certificate is listed as CSSMERR_TP_NOT_TRUSTED, which is
     # expected and does not stop codesign from using it.
-    local matches
-    matches="$(security find-identity -p codesigning 2>/dev/null \
+    local listing matches
+    listing="$(security find-identity -p codesigning 2>&1)" \
+        || atmos_die "security find-identity failed: $listing"
+    # The wanted name goes to awk through ENVIRON, not -v: -v would expand backslash escapes
+    # and match a different name than the one the deny-list checked.
+    matches="$(printf '%s\n' "$listing" \
         | sed -nE 's/^[[:space:]]+[0-9]+\) ([0-9A-F]{40}) "(.*)".*$/\1	\2/p' \
-        | awk -F '\t' -v w="$want" '($2 == w || toupper($1) == toupper(w)) && !seen[$1]++')"
+        | ATMOS_WANT="$want" awk -F '\t' '($2 == ENVIRON["ATMOS_WANT"] || toupper($1) == toupper(ENVIRON["ATMOS_WANT"])) && !seen[$1]++')"
     local n
     n="$(printf '%s' "$matches" | grep -c . || true)"
     [ "$n" = "1" ] || atmos_die "expected exactly one code-signing identity named '$want' in the keychain, found $n (see: security find-identity -p codesigning)"

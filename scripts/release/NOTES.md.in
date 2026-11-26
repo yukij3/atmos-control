@@ -1,4 +1,4 @@
-atmos-control @VERSION@ (pre-release), built from commit `@COMMIT@`.
+atmos-control @VERSION@@CHANNEL@, built from commit `@COMMIT@`.
 
 ## Files
 

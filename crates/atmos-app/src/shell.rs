@@ -47,6 +47,8 @@ pub struct Shell {
     tray: RefCell<Option<Tray>>,
     icons: [Option<TrayIcon>; 3],
     tray_glyph: Cell<Option<TrayGlyph>>,
+    /// The tooltip last set: engine changes arrive at meter rate while a window is visible.
+    tray_tooltip: RefCell<String>,
     panel_visible: Cell<bool>,
     settings_visible: Cell<bool>,
     panel_hidden_at: Cell<Option<Instant>>,
@@ -65,6 +67,7 @@ impl Shell {
             tray: RefCell::new(None),
             icons: TrayGlyph::ALL.map(crate::glyph::tray_icon),
             tray_glyph: Cell::new(None),
+            tray_tooltip: RefCell::new(String::new()),
             panel_visible: Cell::new(headless),
             settings_visible: Cell::new(headless),
             panel_hidden_at: Cell::new(None),
@@ -182,6 +185,7 @@ impl Shell {
             Ok(tray) => {
                 *self.tray.borrow_mut() = Some(tray);
                 self.tray_glyph.set(None);
+                self.tray_tooltip.borrow_mut().clear();
                 self.sync_tray();
             }
             Err(err) => {
@@ -214,7 +218,12 @@ impl Shell {
         {
             eprintln!("atmos-control: menu-bar glyph update failed: {err}");
         }
-        tray.set_tooltip(format!("atmos-control — {status}"));
+        // Only on a change: setToolTip on every meter tick resets a tooltip being read.
+        let tooltip = format!("atmos-control — {status}");
+        if *self.tray_tooltip.borrow() != tooltip {
+            tray.set_tooltip(tooltip.clone());
+            *self.tray_tooltip.borrow_mut() = tooltip;
+        }
     }
 }
 

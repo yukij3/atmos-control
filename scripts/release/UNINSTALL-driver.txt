@@ -6,6 +6,8 @@ Quit atmos-control first. Then, in Terminal:
     sudo rm -rf /Library/Audio/Plug-Ins/HAL/atmos-control.driver
     sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
 
+If the last command is refused ("Operation not permitted", as with SIP on), run
+`sudo killall coreaudiod` instead; launchd starts it again at once.
 Audio devices drop out for about a second while coreaudiod restarts.
 If the system output was left on "atmos-control", pick your real output again in
 System Settings > Sound > Output.
