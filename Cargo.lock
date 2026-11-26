@@ -348,6 +348,13 @@ name = "atmos-core-sys"
 version = "0.1.0"
 
 [[package]]
+name = "atmos-kit"
+version = "0.1.0"
+dependencies = [
+ "rune",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

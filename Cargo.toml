@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 atmos-core-sys = { path = "crates/atmos-core-sys" }
 atmos-core = { path = "crates/atmos-core" }
+atmos-kit = { path = "crates/atmos-kit" }
 # Rune is pre-release: pin one `dev` revision. Every [patch.crates-io] entry below must use the
 # same git URL and the same rev as this line (Rune's "Depending on Rune"). To bump: read Rune's
 # root Cargo.toml at the new rev and copy its [patch.crates-io] list, all at the new rev.

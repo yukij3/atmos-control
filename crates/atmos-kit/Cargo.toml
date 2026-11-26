@@ -1,47 +1,21 @@
 [package]
 name = "atmos-kit"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Custom-drawn instrument components for atmos-control's Rune UI: soundstage radar, elevation gauge, level meters, readout and design tokens."
-publish = false
+publish.workspace = true
 
 [dependencies]
 # Rune pinned to one dev revision (Rune's crates/rune/README.md, "Depending on Rune"). Every Rune
 # line and every patch below names the same URL and rev. The library needs none of Rune's
 # optional features; the app turns on what it uses.
-rune = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa", default-features = false }
+rune = { workspace = true, default-features = false }
 
 [dev-dependencies]
 # The gallery opens a window (or renders headless with --snap), so it takes Rune's defaults,
 # as the app does.
-rune = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+rune = { workspace = true }
 
 [[example]]
 name = "gallery"
-
-# TEMP: remove when merged into the root workspace.
-# A workspace of its own so this crate builds standalone (target dir: crates/atmos-kit/target)
-# while the root workspace is being created on another branch.
-[workspace]
-
-# TEMP: remove when merged into the root workspace (the root carries the same list).
-# Rune's own [patch.crates-io] at rev 66006728af7cd3dc54a6bb31ca7690242fb8d6aa. Cargo doesn't
-# inherit patches from a dependency, so the app's workspace root repeats each one.
-[patch.crates-io]
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-naga = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-winit = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
-
-# TEMP: remove when merged into the root workspace (profiles apply only at a workspace root).
-# Mirrors Rune's own dev profile.
-[profile.dev]
-debug = "line-tables-only"
-
-[profile.dev.package."*"]
-debug = false
