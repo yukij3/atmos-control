@@ -3,11 +3,13 @@
 #
 # Usage:
 #   scripts/release.sh <X.Y.Z>             build + package into dist/release/<X.Y.Z>/ (no network)
-#   scripts/release.sh <X.Y.Z> --publish   same, then tag v<X.Y.Z>, push the tag and create a
-#                                          GitHub pre-release with the zips + SHA256SUMS.txt
+#   scripts/release.sh <X.Y.Z> --publish   same, then tag v<X.Y.Z>, push the tag, create a
+#                                          GitHub pre-release with the zips + SHA256SUMS.txt and
+#                                          point the Homebrew casks (yukij3/homebrew-tap) at it
 #
 # Options:
-#   --publish        tag, push and create the GitHub release (asks for confirmation first)
+#   --publish        tag, push, create the GitHub release and bump the Homebrew tap
+#                    (asks for confirmation first)
 #   --not-prerelease publish as a regular release instead of a pre-release
 #
 # Environment:
@@ -30,7 +32,7 @@ info() { printf '\n==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { atmos_die "$@"; }
 
-usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 VERSION=""
 PUBLISH=0
@@ -220,6 +222,7 @@ info "About to publish"
 [ "$TAG_REMOTE" = "1" ] || echo "    git push origin $TAG"
 echo "    gh release create $TAG --repo $GH_REPO $([ "$PRERELEASE" = 1 ] && echo --prerelease) --title \"$TITLE\" --notes-file $OUT/NOTES.md"
 echo "        $OUT/$APP_ZIP $OUT/$DRIVER_ZIP $OUT/SHA256SUMS.txt"
+echo "    scripts/release/bump-tap.sh $VERSION $OUT/SHA256SUMS.txt"
 printf 'Type the version (%s) to continue: ' "$VERSION"
 read -r reply < /dev/tty
 [ "$reply" = "$VERSION" ] || die "cancelled"
@@ -233,3 +236,7 @@ GH_ARGS=(release create "$TAG" --repo "$GH_REPO" --verify-tag --title "$TITLE" -
 gh "${GH_ARGS[@]}" "$OUT/$APP_ZIP" "$OUT/$DRIVER_ZIP" "$OUT/SHA256SUMS.txt" \
     || die "creating the GitHub release failed; $TAG is on origin. Delete any partial release (gh release delete $TAG --repo $GH_REPO), then $RERUN"
 info "Published $TAG"
+
+info "Updating the Homebrew tap"
+scripts/release/bump-tap.sh "$VERSION" "$OUT/SHA256SUMS.txt" \
+    || die "$TAG is published, but updating the Homebrew tap failed; rerun only that step: scripts/release/bump-tap.sh $VERSION $OUT/SHA256SUMS.txt"

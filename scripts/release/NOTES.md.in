@@ -11,6 +11,15 @@ atmos-control @VERSION@@CHANNEL@, built from commit `@COMMIT@`.
 - Apple Silicon Mac, macOS 26 (Tahoe) or newer.
 - For personalized HRTF and head tracking: AirPods with a Personalized Spatial Audio profile. Other headphones get Apple's generic HRTF.
 
+## Install with Homebrew
+
+```bash
+brew install --cask yukij3/tap/atmos-control
+brew install --cask yukij3/tap/atmos-control-driver   # optional: Surround 7.1.4 and Stereo modes
+```
+
+The casks clear the quarantine flag and install the driver for you, so you can skip the unzip, "Open Anyway" and `install-driver.sh` steps below.
+
 ## Opening the app
 
 The app is signed with a self-signed certificate (`@SIGNER@`) and is not notarized, so macOS blocks the first launch. Unzip it, move `atmos-control.app` to `/Applications`, then either:

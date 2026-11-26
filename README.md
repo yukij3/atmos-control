@@ -27,29 +27,45 @@ It renders stereo and 7.1.4 audio binaurally. It does not decode Dolby Atmos.
 
 ## Install
 
-1. Download `atmos-control-<version>-macos-arm64.zip` from
-   [Releases](https://github.com/yukij3/atmos-control/releases), unzip it and move
-   `atmos-control.app` to `/Applications`.
-2. Open it. The app is self-signed and not notarized, so macOS blocks the first launch. Close
-   the warning, go to System Settings ▸ Privacy & Security, click "Open Anyway" next to the
-   atmos-control message and confirm. (Right-click ▸ Open no longer skips this on macOS 15 and
-   later.) Or clear the quarantine flag instead:
+With [Homebrew](https://brew.sh):
 
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/atmos-control.app
-   ```
+```bash
+brew install --cask yukij3/tap/atmos-control
+```
 
-3. The app lives in the menu bar and has no Dock icon. Click the menu-bar icon to open the
+The app is self-signed and not notarized; the cask clears its quarantine flag, so it opens
+without a Gatekeeper prompt. `brew upgrade --cask atmos-control` updates it.
+
+Without Homebrew, download `atmos-control-<version>-macos-arm64.zip` from
+[Releases](https://github.com/yukij3/atmos-control/releases), unzip it and move
+`atmos-control.app` to `/Applications`. macOS blocks its first launch: close the warning, go to
+System Settings ▸ Privacy & Security, click "Open Anyway" next to the atmos-control message and
+confirm. (Right-click ▸ Open no longer skips this on macOS 15 and later.) Or clear the
+quarantine flag instead:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/atmos-control.app
+```
+
+### First launch
+
+1. The app lives in the menu bar and has no Dock icon. Click the menu-bar icon to open the
    panel. The first time you turn the engine on, macOS asks for permission to capture audio,
    and the panel shows "Awaiting capture permission…" until you answer. Allow it. If
    you deny it, the panel offers Open Privacy Settings and Try Again.
-4. Turn off Spatial Audio for your AirPods in Control Center ▸ Sound. Otherwise the audio is
+2. Turn off Spatial Audio for your AirPods in Control Center ▸ Sound. Otherwise the audio is
    spatialized twice.
 
 ### Optional: the loopback driver
 
-You only need the driver for the Surround 7.1.4 and Stereo modes. Download
-`atmos-control-driver-<version>.zip` from the same release, unzip it, and run:
+You only need the driver for the Surround 7.1.4 and Stereo modes.
+
+```bash
+brew install --cask yukij3/tap/atmos-control-driver   # asks for your admin password
+```
+
+Without Homebrew, download `atmos-control-driver-<version>.zip` from the same release, unzip it,
+and run:
 
 ```bash
 cd ~/Downloads/atmos-control-driver-<version>
@@ -57,9 +73,9 @@ bash install-driver.sh --dry-run   # print the commands it will run
 bash install-driver.sh             # asks for confirmation and your admin password
 ```
 
-The script clears the quarantine flag, copies `atmos-control.driver` to
-`/Library/Audio/Plug-Ins/HAL` and restarts `coreaudiod`, so audio drops out for about a second.
-An output device named "atmos-control" should then appear in System Settings ▸ Sound.
+Either way, `atmos-control.driver` is copied to `/Library/Audio/Plug-Ins/HAL` and `coreaudiod`
+restarts, so audio drops out for about a second. An output device named "atmos-control" should
+then appear in System Settings ▸ Sound.
 
 The driver has only been tested with System Integrity Protection disabled. Whether it loads with
 SIP on has not been verified yet. Don't disable SIP for it; if the device doesn't appear, open an
@@ -110,7 +126,10 @@ issue with your macOS version.
 
 ## Uninstall
 
-Quit atmos-control and delete `/Applications/atmos-control.app`. To remove the driver:
+With Homebrew: `brew uninstall --cask atmos-control`, and `brew uninstall --cask
+atmos-control-driver` if you installed the driver.
+
+Otherwise quit atmos-control and delete `/Applications/atmos-control.app`. To remove the driver:
 
 ```bash
 sudo rm -rf /Library/Audio/Plug-Ins/HAL/atmos-control.driver
