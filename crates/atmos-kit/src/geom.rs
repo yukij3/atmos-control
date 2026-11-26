@@ -3,28 +3,19 @@
 
 use rune::Path;
 
-/// Adds a circle (clockwise on screen, `steps` sides) to `path` as its own closed subpath.
-pub fn circle(path: Path, cx: f32, cy: f32, r: f32, steps: usize) -> Path {
-    let steps = steps.max(8);
-    let pts: Vec<[f32; 2]> = (0..steps)
-        .map(|i| {
-            let a = i as f32 / steps as f32 * std::f32::consts::TAU;
-            [cx + r * a.cos(), cy + r * a.sin()]
-        })
-        .collect();
-    path.polygon(pts)
-}
-
-/// Adds an axis-aligned ellipse (clockwise on screen) to `path` as its own closed subpath.
-pub fn ellipse(path: Path, cx: f32, cy: f32, rx: f32, ry: f32, steps: usize) -> Path {
-    let steps = steps.max(8);
-    let pts: Vec<[f32; 2]> = (0..steps)
-        .map(|i| {
-            let a = i as f32 / steps as f32 * std::f32::consts::TAU;
-            [cx + rx * a.cos(), cy + ry * a.sin()]
-        })
-        .collect();
-    path.polygon(pts)
+/// Adds an axis-aligned ellipse to `path` as its own closed subpath of four cubic Béziers,
+/// clockwise on screen (right, bottom, left, top), so parts drawn with it and filled non-zero
+/// merge into one silhouette. Rune flattens the curves to 0.1 pt: smooth at any size or turn.
+pub fn ellipse_path(path: Path, cx: f32, cy: f32, rx: f32, ry: f32) -> Path {
+    // The control-point distance that makes a quarter circle out of one cubic.
+    const K: f32 = 0.552_284_8;
+    let (kx, ky) = (rx * K, ry * K);
+    path.move_to([cx + rx, cy])
+        .cubic_to([cx + rx, cy + ky], [cx + kx, cy + ry], [cx, cy + ry])
+        .cubic_to([cx - kx, cy + ry], [cx - rx, cy + ky], [cx - rx, cy])
+        .cubic_to([cx - rx, cy - ky], [cx - kx, cy - ry], [cx, cy - ry])
+        .cubic_to([cx + kx, cy - ry], [cx + rx, cy - ky], [cx + rx, cy])
+        .close()
 }
 
 /// The outline of an open polyline `width` wide with mitred joints and butt ends, as one simple
