@@ -386,13 +386,14 @@ impl MockEngine {
     }
 
     pub fn select_output(&mut self, selection: OutputSelection) {
-        if self.s.capture_choice == CaptureChoice::Personalized { return; }
+        // Ignored while busy, as the engine does (atmos_core.h).
+        if self.s.capture_choice == CaptureChoice::Personalized || self.s.busy { return; }
         self.s.selected_output = match selection {
             OutputSelection::FollowDefault => None,
             OutputSelection::Device(id) if self.device(id).is_some() => Some(id),
             OutputSelection::Device(_) => return,
         };
-        if self.s.is_on && !self.s.busy { self.rebuild(); }
+        if self.s.is_on { self.rebuild(); }
         self.derive();
         self.changed();
     }
