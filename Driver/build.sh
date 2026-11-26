@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
-# Driver/build.sh — build, assemble, and ad-hoc sign atmos-control.driver
+# Driver/build.sh — build, assemble, and sign atmos-control.driver
 # Uses only CLT clang; no Xcode required.
-# SIP must be disabled for coreaudiod to load the unsigned (ad-hoc) bundle.
+#
+# Environment (see scripts/lib/signing.sh):
+#   ATMOS_VERSION=X.Y.Z   stamped into the bundle's Info.plist (default: latest vX.Y.Z tag, else 0.0.0)
+#   ATMOS_BUILD=N         CFBundleVersion (default: ATMOS_VERSION)
+#   SIGN_IDENTITY=name    exact code-signing identity name; unset or "-" = ad hoc (default)
+#
+# Loading: this bundle has only been tested on a Mac with SIP disabled. The HAL plug-in host
+# (Core-Audio-Driver-Service) runs with library validation disabled, so a self-signed or
+# ad-hoc signature is expected to load with SIP on as well, but that is not verified yet.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../scripts/lib/signing.sh"
+atmos_resolve_version
+atmos_resolve_identity
 
 SOURCES="$SCRIPT_DIR/Sources/AtmosDriver.c"
 INFO_PLIST="$SCRIPT_DIR/Info.plist"
@@ -22,6 +33,7 @@ echo "==> SDK: $SDK"
 echo "==> Building atmos-control.driver …"
 
 # ── 1. Compile & link as a bundle ──────────────────────────────────────────
+rm -rf "$BUNDLE_DIR"   # start clean so no stale files end up inside the signed bundle
 mkdir -p "$MACOS_DIR"
 
 clang \
@@ -41,18 +53,20 @@ clang \
 
 echo "==> Binary:  $BINARY"
 
-# ── 2. Copy Info.plist ─────────────────────────────────────────────────────
+# ── 2. Copy Info.plist, stamp the version ──────────────────────────────────
 cp "$INFO_PLIST" "$CONTENTS_DIR/Info.plist"
-echo "==> Info.plist copied."
+plutil -replace CFBundleShortVersionString -string "$ATMOS_VERSION" "$CONTENTS_DIR/Info.plist"
+plutil -replace CFBundleVersion -string "$ATMOS_BUILD" "$CONTENTS_DIR/Info.plist"
+echo "==> Info.plist copied (version $ATMOS_VERSION, build $ATMOS_BUILD)."
 
-# ── 3. Ad-hoc code sign ────────────────────────────────────────────────────
-codesign --force --sign - --timestamp=none "$BUNDLE_DIR"
-echo "==> Bundle signed (ad-hoc)."
+# ── 3. Code sign ───────────────────────────────────────────────────────────
+atmos_sign "$BUNDLE_DIR"
+echo "==> Bundle signed ($SIGN_NAME)."
 
 # ── 4. Verify ──────────────────────────────────────────────────────────────
 echo ""
-echo "=== codesign -dv ==="
-codesign -dv "$BUNDLE_DIR" 2>&1
+echo "=== codesign verify ==="
+atmos_check_signature "$BUNDLE_DIR"
 
 echo ""
 echo "=== Bundle layout ==="

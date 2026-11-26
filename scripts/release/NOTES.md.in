@@ -1,0 +1,51 @@
+atmos-control @VERSION@@CHANNEL@, built from commit `@COMMIT@`.
+
+## Files
+
+- `@APP_ZIP@`: the menu-bar app. The default Personalized mode needs nothing else.
+- `@DRIVER_ZIP@`: optional audio driver, only for the Surround 7.1.4 and Stereo modes. Contains `atmos-control.driver`, `install-driver.sh` and `UNINSTALL.txt`.
+- `SHA256SUMS.txt`: SHA-256 checksums of both zips.
+
+## Requirements
+
+- Apple Silicon Mac, macOS 26 (Tahoe) or newer.
+- For personalized HRTF and head tracking: AirPods with a Personalized Spatial Audio profile. Other headphones get Apple's generic HRTF.
+
+## Opening the app
+
+The app is signed with a self-signed certificate (`@SIGNER@`) and is not notarized, so macOS blocks the first launch. Unzip it, move `atmos-control.app` to `/Applications`, then either:
+
+- open it once and close the warning, then go to System Settings > Privacy & Security, click "Open Anyway" next to the atmos-control message and confirm (right-click > Open no longer skips this on macOS 15 and later), or
+- clear the quarantine flag in Terminal:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/atmos-control.app
+  ```
+
+The app lives in the menu bar and has no Dock icon. The first time you turn it on, macOS asks for permission to capture audio. Allow it. Later releases signed with the same certificate keep that permission.
+
+Turn off Spatial Audio for your AirPods (Control Center > Sound) before listening, or the audio is spatialized twice.
+
+## Installing the driver (optional)
+
+```bash
+cd ~/Downloads/@DRIVER_DIR@        # wherever the zip was extracted
+bash install-driver.sh --dry-run   # print the commands it will run
+bash install-driver.sh             # asks for confirmation and your admin password
+```
+
+The script clears the quarantine flag, copies `atmos-control.driver` to `/Library/Audio/Plug-Ins/HAL` and restarts coreaudiod (audio drops out for about a second). An output device named "atmos-control" should then appear in System Settings > Sound. To remove the driver, follow `UNINSTALL.txt`.
+
+The driver has only been tested with System Integrity Protection disabled. Whether it loads with SIP on has not been verified. Don't disable SIP for it. If the device doesn't appear, open an issue with your macOS version and the output of:
+
+```bash
+log show --last 5m --predicate 'process CONTAINS "coreaudiod" OR process CONTAINS "Core Audio Driver"' | grep -i atmos
+```
+
+## Checksums
+
+```
+@CHECKSUMS@
+```
+
+Verify with `shasum -a 256 -c --ignore-missing SHA256SUMS.txt` in the download folder.

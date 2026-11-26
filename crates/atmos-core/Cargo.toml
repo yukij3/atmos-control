@@ -1,0 +1,16 @@
+[package]
+name = "atmos-core"
+description = "Safe, typed engine API for the Rune views: the Swift engine over atmos-core-sys, or a mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+atmos-core-sys = { workspace = true }
+
+# Runs on the process's main thread (the C ABI's contract) and drives the main run loop.
+[[test]]
+name = "real_core"
+harness = false

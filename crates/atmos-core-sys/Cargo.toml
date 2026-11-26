@@ -1,0 +1,11 @@
+[package]
+name = "atmos-core-sys"
+description = "Raw C ABI of libAtmosCore (the Swift engine dylib) and its link setup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "AtmosCore"
+build = "build.rs"
+
+[dependencies]

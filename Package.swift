@@ -6,6 +6,12 @@ let package = Package(
     platforms: [
         .macOS("15.0")
     ],
+    products: [
+        // The engine + state model as a dynamic library with a C ABI, loaded by the Rust (Rune)
+        // app binary from Contents/Frameworks (crates/atmos-core-sys links it; App/build-app.sh
+        // bundles it).
+        .library(name: "AtmosCore", type: .dynamic, targets: ["AtmosCore"]),
+    ],
     targets: [
         .testTarget(name: "SpatialEngineTests", dependencies: ["SpatialEngine"]),
         // Phase 0 de-risk spike: a CLI harness that instantiates AUSpatialMixer,
@@ -34,12 +40,31 @@ let package = Package(
             dependencies: ["SpatialEngine"],
             path: "Sources/AtmosDaemon"
         ),
-        // Phase 3: SwiftUI menu-bar control app. Hosts the engine in-process; the
-        // binary is wrapped into atmos-control.app by App/build-app.sh (LSUIElement).
+        // The C ABI's header (include/atmos_core.h): the contract with the Rust UI. A C target
+        // so the Swift implementation and the Rust declarations share one definition.
+        .target(
+            name: "AtmosCoreABI",
+            path: "Sources/AtmosCoreABI"
+        ),
+        // The app's state model (EngineController: power orchestration, device hot-swap, format
+        // recovery, telemetry, head motion) behind the C ABI. Built as libAtmosCore.dylib.
+        .target(
+            name: "AtmosCore",
+            dependencies: ["SpatialEngine", "AtmosCoreABI"],
+            path: "Sources/AtmosCore",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("CoreMotion"),
+                .linkedFramework("CoreAudio"),
+            ]
+        ),
+        // Offline CPU benchmark + null-test regression harness over the real render path
+        // (same mixer graph + RT callbacks, synthetic input, no device IO).
+        // `swift run -c release EngineBench [--filter x] [--record dir | --compare dir]`.
         .executableTarget(
-            name: "AtmosControlApp",
+            name: "EngineBench",
             dependencies: ["SpatialEngine"],
-            path: "Sources/AtmosControlApp"
+            path: "Sources/EngineBench"
         ),
         // Phase 4 spike: prove personalized HRTF (3116) engages while capturing the
         // system mix via a MUTING process tap, WITHOUT hijacking the default output

@@ -1,0 +1,21 @@
+[package]
+name = "atmos-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Custom-drawn instrument components for atmos-control's Rune UI: soundstage radar, elevation gauge, level meters, readout and design tokens."
+publish.workspace = true
+
+[dependencies]
+# Rune pinned to one dev revision (Rune's crates/rune/README.md, "Depending on Rune"). Every Rune
+# line and every patch below names the same URL and rev. The library needs none of Rune's
+# optional features; the app turns on what it uses.
+rune = { workspace = true, default-features = false }
+
+[dev-dependencies]
+# The gallery opens a window (or renders headless with --snap), so it takes Rune's defaults,
+# as the app does.
+rune = { workspace = true }
+
+[[example]]
+name = "gallery"

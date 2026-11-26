@@ -77,14 +77,24 @@ if ! command -v swift >/dev/null 2>&1; then
     fail "'swift' not found on PATH. Install the Xcode command line tools: xcode-select --install"
 fi
 
-info "OK: Apple Silicon, macOS $(sw_vers -productVersion), swift present"
+# The UI is Rust (Rune): cargo builds it. rustup's ~/.cargo/bin may be missing from PATH in a
+# non-login shell, so look there too.
+if ! command -v cargo >/dev/null 2>&1 && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]; then
+    PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"; export PATH
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    fail "'cargo' not found. atmos-control's UI is written in Rust. Install Rust with rustup:
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  (see https://rustup.rs), then open a new terminal (or run: . \"\$HOME/.cargo/env\") and run ./install.sh again.
+  The exact toolchain is pinned in rust-toolchain.toml; rustup downloads it on the first build."
+fi
 
-# ── (b) Build the package (release) ─────────────────────────────────────────
-info "Building (swift build -c release)"
-swift build -c release
+info "OK: Apple Silicon, macOS $(sw_vers -productVersion), swift and cargo present"
 
-# ── (c) Build the app bundle into dist/ ─────────────────────────────────────
-info "Assembling the app bundle (App/build-app.sh)"
+# ── (b)+(c) Build the engine (Swift) and the UI (Rust), assemble dist/ ─────
+# App/build-app.sh runs `swift build -c release --product AtmosCore` (the engine dylib) and
+# `cargo build --release` (the UI binary), then assembles and signs the bundle.
+info "Building and assembling the app bundle (App/build-app.sh)"
 bash "$REPO_ROOT/App/build-app.sh" release
 [ -d "$DIST_APP" ] || fail "expected bundle not found: $DIST_APP"
 
@@ -109,8 +119,12 @@ EOT
 
 # Always build the driver (building is safe and touches nothing privileged).
 info "Building the driver (Driver/build.sh)"
-bash "$REPO_ROOT/Driver/build.sh" >/dev/null 2>&1 || warn "driver build reported issues; see Driver/build.sh output"
-if [ ! -d "$DRIVER_SRC" ]; then
+# A failed build can leave a half-assembled bundle behind (build.sh starts from an empty
+# Contents/MacOS): never let that replace an installed, working driver.
+DRIVER_LOG="$(mktemp -t atmos-driver-build)"
+if ! bash "$REPO_ROOT/Driver/build.sh" >"$DRIVER_LOG" 2>&1; then
+    warn "driver build failed (log: $DRIVER_LOG) — skipping driver install steps."
+elif [ ! -x "$DRIVER_SRC/Contents/MacOS/atmos-control" ]; then
     warn "driver bundle not found at $DRIVER_SRC — skipping driver install steps."
 else
     if [ "$WITH_DRIVER" = "1" ]; then
@@ -124,7 +138,11 @@ else
         fi
         priv sudo cp -R "$DRIVER_SRC" "$DRIVER_DEST"
         priv sudo chown -R root:wheel "$DRIVER_DEST"
-        priv sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+        # kickstart is refused with SIP on (macOS 14.4+); coreaudiod is KeepAlive, so a kill
+        # makes launchd restart it.
+        priv sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null \
+            || priv sudo killall coreaudiod \
+            || fail "driver copied to $DRIVER_DEST, but coreaudiod could not be restarted: restart the Mac to load it."
         info "Driver installed."
     else
         cat <<EOT
@@ -135,6 +153,7 @@ else
         sudo cp -R "$DRIVER_SRC" "$DRIVER_DEST"
         sudo chown -R root:wheel "$DRIVER_DEST"
         sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+        (if that is refused, as with SIP on: sudo killall coreaudiod)
 
     (coreaudiod restart makes audio devices blink for about a second.)
 EOT
