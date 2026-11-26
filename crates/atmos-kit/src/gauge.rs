@@ -2,10 +2,10 @@
 //! ends level with the radar's outer ring and its middle level with the radar's head. A side-view
 //! head mark sits at 0° (ear level); the source marks ride the arc.
 
-use rune::{Align, El, LineCap, Path, Shape, canvas, el, text};
+use rune::{Align, El, FillRule, LineCap, Path, Shape, canvas, el, text};
 
 use crate::format;
-use crate::geom::circle;
+use crate::geom::ellipse_path;
 use crate::radar::{RadarGeometry, marker};
 use crate::stage::{Layer, SourceMode, Soundstage, range};
 use crate::theme::{Theme, ty};
@@ -168,12 +168,14 @@ fn scale(geo: &GaugeGeometry, t: &Theme) -> Shape {
     }
     // Ear level: a faint line from the head to the arc.
     let (hx, hr) = (geo.head_x, geo.head_radius);
-    shape = shape.line([hx + hr * 1.7, cy], [geo.chord_x + geo.bow - 0.5, cy], 1.0, LineCap::Butt, t.c.grid);
-    // Side-view head facing the arc (front).
-    let head = circle(Path::new(), hx, cy, hr, 32).polygon(vec![
-        [hx + hr * 0.75, cy - hr * 0.42],
-        [hx + hr * 1.45, cy],
-        [hx + hr * 0.75, cy + hr * 0.42],
-    ]);
-    shape.fill_path(&head, t.c.head)
+    // (It starts past the nose, so the two never overlap.)
+    shape = shape.line([hx + hr * 1.5 + 2.8, cy], [geo.chord_x + geo.bow - 0.5, cy], 1.0, LineCap::Butt, t.c.grid);
+    // Side-view head facing the arc (front), in the radar head's language: a ring for the skull
+    // and a small solid nose just clear of it.
+    let half = 0.5;
+    let skull = ellipse_path(ellipse_path(Path::new(), hx, cy, hr + half, hr + half), hx, cy, hr - half, hr - half);
+    let nx = hx + hr + half + 0.8;
+    shape
+        .fill_path_with(&skull, FillRule::EvenOdd, t.c.head)
+        .fill(vec![[nx, cy - hr * 0.42], [nx + hr * 0.5, cy], [nx, cy + hr * 0.42]], t.c.head)
 }

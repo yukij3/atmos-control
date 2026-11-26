@@ -6,10 +6,10 @@
 
 use std::rc::Rc;
 
-use rune::{Align, Color, Cursor, Drag, El, Key, KeyEvent, LineCap, Path, Phase, Shape, Tx, canvas, el, text};
+use rune::{Align, Color, Cursor, Drag, El, FillRule, Key, KeyEvent, LineCap, Path, Phase, Shape, Tx, canvas, el, text};
 
 use crate::format;
-use crate::geom::{arc_band, circle, ellipse, thick_polyline};
+use crate::geom::{arc_band, ellipse_path, thick_polyline};
 use crate::stage::{Emitter, Layer, RadarScale, SourceMode, Soundstage, range, wrap_degrees};
 use crate::theme::{Theme, ty};
 
@@ -78,8 +78,8 @@ impl RadarGeometry {
         let radius = size / 2.0 - margin;
         let head_radius = (radius * 0.085).clamp(5.5, 11.0);
         let dot = if labels { 10.0 } else { 8.0 };
-        // The head reaches 1.45 r at the nose and 1.25 r at the ears; the clearance keeps a
-        // 0.35 m source's marker a few points off it in every direction.
+        // The head reaches about 1.45 r at the nose tip and 1.25 r at the ears (see `head`); the
+        // clearance keeps a 0.35 m source's marker a few points off it in every direction.
         let clearance = head_radius * 1.45 + dot / 2.0 + 5.0;
         RadarGeometry {
             size,
@@ -320,20 +320,35 @@ fn world_marks(geo: &RadarGeometry, t: &Theme) -> Shape {
     shape.fill(vec![[c - hw, c - r - h], [c + hw, c - r - h], [c, c - r]], t.c.grid_strong)
 }
 
-/// The listener head (top-down: round head, nose, two ears) and the front chevron inside the
-/// outer ring. One filled path, so translucent ink never blends twice where parts overlap.
+/// The listener head and the front chevron inside the outer ring. See [`head_path`].
 fn head_marks(geo: &RadarGeometry, t: &Theme) -> Shape {
-    let (c, r, h) = (geo.center(), geo.radius(), geo.head_radius);
-    let nose_w = h * 0.44;
-    let path = circle(Path::new(), c, c, h, 48)
-        .polygon(vec![[c - nose_w, c - h * 0.78], [c, c - h * 1.36], [c + nose_w, c - h * 0.78]]);
-    // Ears: small flat ovals tucked against the sides.
-    let path = ellipse(ellipse(path, c - h * 0.97, c, h * 0.18, h * 0.32, 16), c + h * 0.97, c, h * 0.18, h * 0.32, 16);
+    let (c, r) = (geo.center(), geo.radius());
     // Chevron "^" just inside the outer ring, pointing where the head faces.
     let (w, ht, th) = if geo.labels { (5.0, 4.5, 1.3) } else { (4.5, 4.0, 1.2) };
     let apex = c - r + 4.5;
     let chevron = thick_polyline(&[[c - w, apex + ht], [c, apex], [c + w, apex + ht]], th);
-    Shape::new().fill_path(&path, t.c.head).fill(chevron, t.c.grid_strong)
+    head(Shape::new(), c, c, geo.head_radius, if geo.labels { 1.5 } else { 1.3 }, t).fill(chevron, t.c.grid_strong)
+}
+
+/// The listener seen from above, facing up, in the radar's stroke language: the skull drawn as
+/// a ring (an ellipse a little longer than wide, `stroke` thick, `h` from the centre to the
+/// crown), a small solid nose and two small ears standing just clear of it. Separate parts
+/// never overlap, so the translucent ink never blends twice; the skull is one even-odd band of
+/// true Béziers (Rune flattens them to 0.1 pt), so it stays smooth as the head turns.
+fn head(shape: Shape, cx: f32, cy: f32, h: f32, stroke: f32, t: &Theme) -> Shape {
+    let (rx, ry, half) = (h * 0.80, h * 0.95, stroke / 2.0);
+    let skull = ellipse_path(ellipse_path(Path::new(), cx, cy, rx + half, ry + half), cx, cy, rx - half, ry - half);
+    // Clear of the skull's outer edge by about a stroke.
+    let gap = stroke * 0.8;
+    let (nw, nh, base) = (h * 0.32, h * 0.36, cy - ry - half - gap);
+    let nose = vec![[cx - nw, base], [cx, base - nh], [cx + nw, base]];
+    let (erx, ery) = (stroke * 0.62, h * 0.30);
+    let ex = rx + half + gap + erx;
+    let ears = ellipse_path(ellipse_path(Path::new(), cx - ex, cy, erx, ery), cx + ex, cy, erx, ery);
+    shape
+        .fill_path_with(&skull, FillRule::EvenOdd, t.c.head)
+        .fill(nose, t.c.head)
+        .fill_path_with(&ears, FillRule::NonZero, t.c.head)
 }
 
 /// Ring labels (1 m, 2 m, 6 m) just inside each ring at 6 o'clock, behind the listener where

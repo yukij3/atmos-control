@@ -6,6 +6,7 @@
 //! - [`ElevationGauge`]: the slim elevation arc beside the radar.
 //! - [`Meters`]: L/R or 12-channel level bars.
 //! - [`Readout`]: `az +30° · el 0° · 1.0 m`, fixed width.
+//! - [`icons`]: the few line icons the UI needs (warning, lock, reset), in one stroke language.
 //!
 //! Inputs are plain values ([`Soundstage`], linear levels, a yaw in radians); nothing here knows
 //! the engine or the bridge. Builders end in `.build(&theme)` and return a Rune [`rune::El`].
@@ -28,6 +29,7 @@
 pub mod format;
 pub mod gauge;
 mod geom;
+pub mod icons;
 pub mod meter;
 pub mod radar;
 pub mod readout;
