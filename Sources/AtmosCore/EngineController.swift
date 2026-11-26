@@ -38,6 +38,11 @@ final class EngineController {
     @ObservationIgnored private var pendingFormatChange = false
     @ObservationIgnored private var formatRetryWorkItem: DispatchWorkItem?
     @ObservationIgnored private let audioQueue = DispatchQueue(label: "dev.atmoscontrol.audio-control", qos: .userInitiated)
+    /// `ATMOS_CORE_LOG` (any value): log each lifecycle operation's outcome and duration to
+    /// stderr, and flag one still running after 3 s. `ATMOS_CORE_LOG=verbose` also routes
+    /// SpatialEngine's setup trace (every property set during start) there.
+    @ObservationIgnored private let diagnostics = ProcessInfo.processInfo.environment["ATMOS_CORE_LOG"]
+    @ObservationIgnored private var operationSerial: UInt64 = 0
     var config = SpatialConfig()
     var lastError: String?
     var atmosPresent = false
@@ -145,6 +150,10 @@ final class EngineController {
     }
 
     init() {
+        if diagnostics == "verbose" {
+            // Runs on the audio control queue (SpatialEngine.start): no actor isolation.
+            engine.logger = { @Sendable line in EngineController.diag("engine: \(line)") }
+        }
         atmosPresent = engine.atmosControlPresent()
         surroundDriverInstalled = engine.surroundDriverInstalled()
         outputs = engine.outputDevices()
@@ -541,8 +550,20 @@ final class EngineController {
         isStarting = true
         stopRequested = false
         stopPolling()
+        operationSerial &+= 1
+        let traced = diagnostics != nil, serial = operationSerial, began = Date()
+        if traced { reportIfSlow(serial) }
         audioQueue.async { [weak self] in
             let result = Result(catching: operation)
+            if traced {
+                let outcome: String
+                switch result {
+                case .success: outcome = "ok"
+                case .failure(let error): outcome = "failed: \(error)"
+                }
+                Self.diag(String(format: "engine operation %llu finished in %.3f s: %@",
+                                 serial, Date().timeIntervalSince(began), outcome))
+            }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isStarting = false
@@ -550,6 +571,23 @@ final class EngineController {
                 self.drainPendingEvents()
             }
         }
+    }
+
+    /// Diagnostics only: say so when lifecycle operation `serial` is still in flight after 3 s.
+    /// The first tap start for a code identity blocks inside the HAL (AudioDeviceStart) while
+    /// macOS shows the audio-capture consent prompt; the HAL gives up after about 30 s.
+    private func reportIfSlow(_ serial: UInt64) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.isStarting, self.operationSerial == serial else { return }
+                Self.diag("engine operation \(serial) still running after 3 s (an audio-capture "
+                          + "consent prompt blocks the first start until answered, ~30 s at most)")
+            }
+        }
+    }
+
+    nonisolated static func diag(_ line: String) {
+        FileHandle.standardError.write(Data("atmos-core: \(line)\n".utf8))
     }
 
     private func drainPendingEvents() {
