@@ -332,8 +332,10 @@ version = "0.1.0"
 dependencies = [
  "atmos-core",
  "atmos-core-sys",
+ "atmos-kit",
  "resvg",
  "rune",
+ "rune-kit",
 ]
 
 [[package]]
@@ -2709,6 +2711,17 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rune-kit"
+version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=66006728af7cd3dc54a6bb31ca7690242fb8d6aa#66006728af7cd3dc54a6bb31ca7690242fb8d6aa"
+dependencies = [
+ "icu_normalizer",
+ "rune",
+ "rune-motion",
+ "unicode-segmentation",
 ]
 
 [[package]]
