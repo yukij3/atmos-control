@@ -7,7 +7,8 @@
 
 import CoreAudio
 import AudioToolbox
-import Darwin          // fabsf, memset, free
+import Darwin          // memset, memcpy, free
+import Accelerate      // vDSP (peaks, downmix)
 import Synchronization // Atomic<UInt64> — release/acquire ordering on the SPSC indices
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,29 @@ final class RingBuffer {
         return toRead
     }
 
+    // Contiguous ring <-> linear copies: at most two memcpy segments per plane (the ring
+    // wraps at most once per block) instead of a masked per-sample loop. Pure copies, so
+    // bit-identical to the previous element-wise loops.
+    @inline(__always)
+    private static func copyOut(_ plane: UnsafeMutablePointer<Float>, from start: UInt64, count: Int,
+                                to dst: UnsafeMutablePointer<Float>) {
+        let s = Int(start & kRingMask)
+        let tail = Int(kRingFrames) - s
+        let first = count < tail ? count : tail
+        memcpy(dst, plane + s, first * 4)
+        if first < count { memcpy(dst + first, plane, (count - first) * 4) }
+    }
+
+    @inline(__always)
+    private static func copyIn(_ plane: UnsafeMutablePointer<Float>, at start: UInt64, count: Int,
+                               from src: UnsafePointer<Float>) {
+        let s = Int(start & kRingMask)
+        let tail = Int(kRingFrames) - s
+        let first = count < tail ? count : tail
+        memcpy(plane + s, src, first * 4)
+        if first < count { memcpy(plane, src + first, (count - first) * 4) }
+    }
+
     /// Producer: copy `frameCount` frames from the N non-interleaved buffers of `abl`
     /// (abl[c].mData) into the N ring planes. Capture RT thread only.
     @inline(__always) @discardableResult
@@ -172,10 +196,7 @@ final class RingBuffer {
         var c = 0
         while c < channels {
             if let raw = abl[c].mData {
-                let src = raw.assumingMemoryBound(to: Float.self)
-                let plane = planes[c]
-                var i: UInt64 = 0
-                while i < toWrite { plane[Int((wi &+ i) & kRingMask)] = src[Int(i)]; i &+= 1 }
+                RingBuffer.copyIn(planes[c], at: wi, count: Int(toWrite), from: raw.assumingMemoryBound(to: Float.self))
             }
             c &+= 1
         }
@@ -192,22 +213,16 @@ final class RingBuffer {
         let want = UInt64(frameCount)
         let toRead = want < available ? want : available
         if toRead == 0 {
-            dst0.initialize(repeating: 0, count: Int(frameCount))
-            dst1.initialize(repeating: 0, count: Int(frameCount))
+            memset(dst0, 0, Int(frameCount) * 4)
+            memset(dst1, 0, Int(frameCount) * 4)
             return 0
         }
-        var i: UInt64 = 0
-        while i < toRead {
-            let slot = Int((ri &+ i) & kRingMask)
-            let di = Int(i)
-            dst0[di] = planes[0][slot]
-            dst1[di] = planes[1][slot]
-            i &+= 1
-        }
+        RingBuffer.copyOut(planes[0], from: ri, count: Int(toRead), to: dst0)
+        RingBuffer.copyOut(planes[1], from: ri, count: Int(toRead), to: dst1)
         if toRead < want {
             let rem = Int(frameCount) - Int(toRead)
-            (dst0 + Int(toRead)).initialize(repeating: 0, count: rem)
-            (dst1 + Int(toRead)).initialize(repeating: 0, count: rem)
+            memset(dst0 + Int(toRead), 0, rem * 4)
+            memset(dst1 + Int(toRead), 0, rem * 4)
         }
         readIdx.store(ri &+ advanceFor(available: available, toRead: toRead), ordering: .releasing)
         return UInt32(toRead)
@@ -224,24 +239,43 @@ final class RingBuffer {
         let toRead = want < available ? want : available
         if toRead == 0 {
             var c = 0
-            while c < channels { dst[c].initialize(repeating: 0, count: Int(frameCount)); c &+= 1 }
+            while c < channels { memset(dst[c], 0, Int(frameCount) * 4); c &+= 1 }
             return 0
         }
         var c = 0
         while c < channels {
-            let plane = planes[c]
             let out = dst[c]
-            var i: UInt64 = 0
-            while i < toRead { out[Int(i)] = plane[Int((ri &+ i) & kRingMask)]; i &+= 1 }
+            RingBuffer.copyOut(planes[c], from: ri, count: Int(toRead), to: out)
             if toRead < want {
                 let rem = Int(frameCount) - Int(toRead)
-                (out + Int(toRead)).initialize(repeating: 0, count: rem)
+                memset(out + Int(toRead), 0, rem * 4)
             }
             c &+= 1
         }
         readIdx.store(ri &+ advanceFor(available: available, toRead: toRead), ordering: .releasing)
         return UInt32(toRead)
     }
+
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Vector helpers (Accelerate; RT-safe: no allocation, no locks)
+// ---------------------------------------------------------------------------
+
+/// max |x| over `n` samples (vDSP_maxmgv) — the meter peak. Same value as the previous
+/// scalar fabsf loop (no arithmetic, only magnitude compare).
+@inline(__always)
+func peakMagnitude(_ p: UnsafePointer<Float>, _ n: Int) -> Float {
+    if n <= 0 { return 0 }
+    var m: Float = 0
+    vDSP_maxmgv(p, 1, &m, vDSP_Length(n))
+    return m
+}
+
+@inline(__always)
+func zeroBuffers(_ abl: UnsafeMutableAudioBufferListPointer) {
+    var b = 0
+    while b < abl.count { if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }; b &+= 1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,21 +394,19 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
 func processCapturedBlock(_ ctx: Ctx, abl: UnsafeMutableAudioBufferListPointer, frames n: UInt32) {
     let written = ctx.ring.writeAll(from: abl, frameCount: n)
     ctx.totalCaptured &+= UInt64(written)
-    // Per-channel peak (raw loop + fabsf — no Swift runtime calls on the RT thread).
+    // Per-channel peak (vDSP_maxmgv — no Swift runtime calls on the RT thread).
     let ch = ctx.channels
     let cnt = Int(n)
     var c = 0
     while c < ch {
         if let raw = abl[c].mData {
-            let src = raw.assumingMemoryBound(to: Float.self)
-            var pk: Float = 0
-            var i = 0
-            while i < cnt { let a = fabsf(src[i]); if a > pk { pk = a }; i &+= 1 }
+            let pk = peakMagnitude(raw.assumingMemoryBound(to: Float.self), cnt)
             if pk > ctx.capturePeaks[c] { ctx.capturePeaks[c] = pk }
         }
         c &+= 1
     }
 }
+
 
 // Sole ring consumer in spatialize mode (runs inside AudioUnitRender on the
 // playback HAL thread). dualPoint = stereo split across two mono buses;
@@ -389,6 +421,33 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
     let nbuf = abl.count
     guard n <= ctx.spatialMaxFrames else {
         var b = 0; while b < nbuf { if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }; b &+= 1 }
+        return noErr
+    }
+    if ctx.unifiedOutputABL != nil, let cap = ctx.captureABL,
+       let lRaw = cap[0].mData, let rRaw = cap[1].mData {
+        // Unified tap path: tap input and device output share one clock and one IO cycle,
+        // so the IOProc's de-interleaved capture planes feed the buses directly (no ring
+        // round trip, no staging). Same samples the ring used to hand over.
+        let l = lRaw.assumingMemoryBound(to: Float.self)
+        let r = rRaw.assumingMemoryBound(to: Float.self)
+        if ctx.spatialDualPoint {
+            if let p = abl[0].mData { memcpy(p, inBusNumber == 0 ? l : r, Int(n) * 4); abl[0].mDataByteSize = n * 4 }
+        } else if ctx.spatialBed {
+            if nbuf >= 2, let p0 = abl[0].mData, let p1 = abl[1].mData {
+                memcpy(p0, l, Int(n) * 4); memcpy(p1, r, Int(n) * 4)
+                abl[0].mDataByteSize = n * 4; abl[1].mDataByteSize = n * 4
+            }
+        } else {
+            var half: Float = 0.5
+            var b = 0
+            while b < nbuf {
+                if let p = abl[b].mData {
+                    vDSP_vasm(l, 1, r, 1, &half, p.assumingMemoryBound(to: Float.self), 1, vDSP_Length(n))
+                    abl[b].mDataByteSize = n * 4
+                }
+                b &+= 1
+            }
+        }
         return noErr
     }
     if ctx.spatialDualPoint {
@@ -459,13 +518,12 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
         return noErr
     }
     ctx.ring.read(ch0: dmL, ch1: dmR, frameCount: n)
-    let cnt = Int(n)
+    // Mono downmix (L+R)·0.5 — vDSP_vasm computes the identical IEEE result.
+    var half: Float = 0.5
     var b = 0
     while b < nbuf {
         if let raw = abl[b].mData {
-            let out = raw.assumingMemoryBound(to: Float.self)
-            var i = 0
-            while i < cnt { out[i] = 0.5 * (dmL[i] + dmR[i]); i &+= 1 }
+            vDSP_vasm(dmL, 1, dmR, 1, &half, raw.assumingMemoryBound(to: Float.self), 1, vDSP_Length(n))
             abl[b].mDataByteSize = n * 4
         }
         b &+= 1
@@ -473,6 +531,8 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
     return noErr
 }
 
+/// Loopback playback pull (AUHAL render callback). The unified tap path renders the mixer
+/// directly from its IOProc (see unifiedTapCallback) and does not go through here.
 nonisolated(unsafe) let playbackRenderCallback: AURenderCallback = { (
     inRefCon, ioActionFlags, inTimeStamp, _, inNumberFrames, ioData
 ) -> OSStatus in

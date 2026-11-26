@@ -47,6 +47,7 @@ nonisolated(unsafe) var optLiveIO: UInt32? = nil
 nonisolated(unsafe) var optLivePollHz = 1.0
 nonisolated(unsafe) var optProxy: Double? = nil
 nonisolated(unsafe) var optProxyRender = true
+nonisolated(unsafe) var optIdleBypass = true
 do {
     var it = CommandLine.arguments.dropFirst().makeIterator()
     while let a = it.next() {
@@ -64,6 +65,7 @@ do {
         case "--live-poll": optLivePollHz = Double(it.next() ?? "") ?? 1
         case "--proxy": optProxy = Double(it.next() ?? "") ?? 5
         case "--proxy-silent": optProxyRender = false
+        case "--no-idle-bypass": optIdleBypass = false
         default: print("unknown option \(a)"); exit(2)
         }
     }
@@ -128,6 +130,23 @@ let allCases: [Case] = [
     c("loop-surround-hrtfhq-reverb") { $0.path = .loopback; $0.tweak = { $0.sourceMode = .surround714; $0.algorithm = .hrtfHQ; $0.reverbEnabled = true } },
     c("loop-surroundbed") { $0.path = .loopback; $0.tweak = { $0.sourceMode = .surroundBed714 } },
     c("loop-passthrough") { $0.path = .loopback; $0.tweak = { $0.spatialize = false } },
+    // Idle-bypass stress cases (signal 2 s on / 2 s off). sourceHz/headPoseHz 1/3 fire at
+    // t = 0, 3, 6 s, i.e. once in the middle of the silent gap (after the bypass engaged).
+    // Head pose goes straight to the mixer's global head params like the OS tracker does.
+    c("default-intermittent-param") { $0.signal = .intermittent; $0.sourceHz = 1.0 / 3 },
+    c("default-intermittent-headpose") { $0.signal = .intermittent; $0.headPoseHz = 1.0 / 3 },
+    c("default-intermittent-headpose50") { $0.signal = .intermittent; $0.headPoseHz = 50 },
+    c("default-intermittent-io128") { $0.signal = .intermittent; $0.io = 128 },
+    c("default-intermittent-16k") { $0.signal = .intermittent; $0.rate = 16_000 },
+    c("bed-intermittent") { $0.signal = .intermittent; $0.tweak = { $0.sourceMode = .ambienceBedStereo } },
+    c("mono-intermittent") { $0.signal = .intermittent; $0.tweak = { $0.sourceMode = .pointSourceMono } },
+    c("hrtfhq-reverb-intermittent-param") { $0.signal = .intermittent; $0.sourceHz = 1.0 / 3
+        $0.tweak = { $0.algorithm = .hrtfHQ; $0.reverbEnabled = true } },
+    c("loop-dual-intermittent") { $0.path = .loopback; $0.signal = .intermittent },
+    c("loop-surround-intermittent-param") { $0.path = .loopback; $0.signal = .intermittent; $0.sourceHz = 1.0 / 3
+        $0.tweak = { $0.sourceMode = .surround714 } },
+    c("loop-surroundbed-intermittent") { $0.path = .loopback; $0.signal = .intermittent
+        $0.tweak = { $0.sourceMode = .surroundBed714 } },
 ]
 
 func selected(_ k: Case) -> Bool {
@@ -217,6 +236,7 @@ final class Session {
         var cfg = SpatialConfig()
         k.tweak(&cfg)
         engine.config = cfg
+        applyBenchSwitches(engine)
         r = try OfflineRenderer(engine: engine, path: k.path, sampleRate: k.rate, ioFrames: k.io)
         ch = r.inputChannels
         let blocks = Int((seconds * k.rate) / Double(k.io)) + 1
@@ -280,10 +300,12 @@ func measure(_ k: Case) throws -> (median: RunResult, min: RunResult) {
 
 let refSeconds = 6.0   // covers two on/off periods of the intermittent signal
 
+nonisolated(unsafe) var lastSkippedPct = 0.0
 func renderReference(_ k: Case) throws -> [Float] {
     let s = try Session(k, seconds: refSeconds)
     let blocks = s.frames / Int(k.io)
     s.run(blocks: blocks, writeOut: true)
+    lastSkippedPct = Double(skippedBlocks(s.r)) / Double(blocks) * 100
     return Array(UnsafeBufferPointer(start: s.output, count: s.frames * 2))
 }
 
@@ -337,7 +359,7 @@ if let dir = optRecord {
 
 if let dir = optCompare {
     var worst = -Double.infinity
-    print("case                              maxAbsDiff(dBFS)  diffRMS/refRMS(dB)  refPeak(dBFS)")
+    print("case                              maxAbsDiff(dBFS)  diffRMS/refRMS(dB)  refPeak(dBFS)  mixer-skipped")
     var failed = false
     for k in cases {
         guard let ref = read("\(dir)/\(k.name).f32") else { print("\(k.name): no reference"); continue }
@@ -354,13 +376,14 @@ if let dir = optCompare {
         print(k.name.padding(toLength: 34, withPad: " ", startingAt: 0)
               + db(maxDiff).padding(toLength: 18, withPad: " ", startingAt: 0)
               + (rel.isFinite ? String(format: "%.1f", rel) : (rel > 0 ? "+inf" : "-inf")).padding(toLength: 20, withPad: " ", startingAt: 0)
-              + db(peak))
+              + db(peak).padding(toLength: 15, withPad: " ", startingAt: 0)
+              + String(format: "%.0f%%", lastSkippedPct))
     }
     print(String(format: "worst maxAbsDiff: %@ dBFS", worst.isFinite ? String(format: "%.1f", worst) : "-inf"))
     exit(failed ? 1 : 0)
 }
 
-print("EngineBench  seconds/rep=\(optSeconds)  reps=\(optReps)  paced=\(optPaced)  (CPU = % of one core at real time, median of reps)")
+print("EngineBench  seconds/rep=\(optSeconds)  reps=\(optReps)  paced=\(optPaced)  idleBypass=\(optIdleBypass)  (CPU = % of one core at real time, median of reps)")
 print("case                              path        rate   io     cpu%    min%    proc%   us/cb   kinstr/cb  mW(proc)  x-realtime")
 for k in cases {
     do {

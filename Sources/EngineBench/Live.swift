@@ -170,6 +170,7 @@ func runLiveOutputProxy(seconds: Double, io: UInt32?, render: Bool, config: Spat
     print("PROXY: [\(out.id)] \(out.name) @ \(Int(rate)) Hz, IO buffer \(buf), render=\(render)")
     let engine = SpatialEngine()
     engine.config = config
+    applyBenchSwitches(engine)
     let renderer = render ? try? OfflineRenderer(engine: engine, path: .unifiedTap, sampleRate: rate, ioFrames: buf) : nil
     let frames = Int(rate) * 4
     let state = ProxyState(renderer: renderer, input: input(frames, rate), frames: frames, maxIO: 8192)
