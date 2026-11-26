@@ -32,14 +32,12 @@ codesign --verify --strict "$SRC" 2>/dev/null \
     || fail "the driver's code signature does not verify; re-download the release zip."
 
 echo "This will run:"
-echo "  1. xattr -dr com.apple.quarantine \"$SRC\""
-if [ -e "$DEST" ]; then
-echo "  2. sudo rm -rf \"$DEST\"            (replace the installed copy)"
-fi
-echo "  3. sudo cp -R \"$SRC\" \"$HAL_DIR/\""
-echo "  4. sudo chown -R root:wheel \"$DEST\""
-echo "  5. sudo xattr -dr com.apple.quarantine \"$DEST\""
-echo "  6. sudo launchctl kickstart -k system/com.apple.audio.coreaudiod"
+echo "  xattr -dr com.apple.quarantine \"$SRC\""
+[ -e "$DEST" ] && echo "  sudo rm -rf \"$DEST\"    (replaces the installed copy)"
+echo "  sudo cp -R \"$SRC\" \"$HAL_DIR/\""
+echo "  sudo chown -R root:wheel \"$DEST\""
+echo "  sudo xattr -dr com.apple.quarantine \"$DEST\""
+echo "  sudo launchctl kickstart -k system/com.apple.audio.coreaudiod"
 echo
 [ "$DRY_RUN" = "1" ] && { echo "(dry run, nothing changed)"; exit 0; }
 
