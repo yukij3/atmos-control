@@ -16,6 +16,11 @@
 //     path into the default output): reports the negotiated IO buffer, callbacks/s and
 //     per-thread CPU of this process. Run it on the target Mac (AirPods connected) to see
 //     costs the offline bench cannot (HAL/tap work on the IO thread, head tracking).
+//     NOTE: needs audio-capture consent; without it AudioDeviceStart blocks on the prompt.
+//   swift run -c release EngineBench --proxy 6 [--live-io 1024] [--proxy-silent]
+//     Output-only proxy (no tap, no consent prompt, inaudible): an IOProc on the default
+//     output renders the engine into scratch and writes silence; measures HAL IO-thread
+//     overhead + wake-ups at the negotiated buffer size.
 //
 // CPU is thread CPU time (CLOCK_THREAD_CPUTIME_ID) of the render loop divided by the audio
 // time rendered = % of one core the engine needs at real time. Param/meter/head-pose updates
@@ -40,6 +45,8 @@ nonisolated(unsafe) var optList = false
 nonisolated(unsafe) var optLive: Double? = nil
 nonisolated(unsafe) var optLiveIO: UInt32? = nil
 nonisolated(unsafe) var optLivePollHz = 1.0
+nonisolated(unsafe) var optProxy: Double? = nil
+nonisolated(unsafe) var optProxyRender = true
 do {
     var it = CommandLine.arguments.dropFirst().makeIterator()
     while let a = it.next() {
@@ -55,6 +62,8 @@ do {
         case "--live": optLive = Double(it.next() ?? "") ?? 5
         case "--live-io": optLiveIO = UInt32(it.next() ?? "")
         case "--live-poll": optLivePollHz = Double(it.next() ?? "") ?? 1
+        case "--proxy": optProxy = Double(it.next() ?? "") ?? 5
+        case "--proxy-silent": optProxyRender = false
         default: print("unknown option \(a)"); exit(2)
         }
     }
@@ -178,7 +187,20 @@ func processCPU() -> UInt64 {
     return ns(ru.ru_utime) + ns(ru.ru_stime)
 }
 
-struct RunResult { var cpuPct: Double; var procPct: Double; var wallPct: Double; var usPerCallback: Double }
+/// Frequency-independent work + CLPC energy estimate for this process (no root needed).
+struct ProcCounters { var instructions: UInt64 = 0; var cycles: UInt64 = 0; var energyNJ: UInt64 = 0
+                      var idleWakeups: UInt64 = 0; var intrWakeups: UInt64 = 0 }
+func procCounters() -> ProcCounters {
+    var ri = rusage_info_v6()
+    let ok = withUnsafeMutablePointer(to: &ri) {
+        $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V6, $0) }
+    }
+    guard ok == 0 else { return ProcCounters() }
+    return ProcCounters(instructions: ri.ri_instructions, cycles: ri.ri_cycles, energyNJ: ri.ri_energy_nj,
+                        idleWakeups: ri.ri_pkg_idle_wkups, intrWakeups: ri.ri_interrupt_wkups)
+}
+
+struct RunResult { var cpuPct: Double; var procPct: Double; var kInstrPerCallback: Double; var milliwatts: Double; var usPerCallback: Double }
 
 final class Session {
     let k: Case
@@ -240,13 +262,14 @@ func measure(_ k: Case) throws -> (median: RunResult, min: RunResult) {
     let audioNS = Double(blocks) * Double(k.io) / k.rate * 1e9
     var results: [RunResult] = []
     for _ in 0..<optReps {
-        let c0 = threadCPU(), w0 = wallNS(), p0 = processCPU()
+        let c0 = threadCPU(), p0 = processCPU(), k0 = procCounters()
         s.run(blocks: blocks, writeOut: false, paced: optPaced)
-        let c1 = threadCPU(), w1 = wallNS(), p1 = processCPU()
+        let c1 = threadCPU(), p1 = processCPU(), k1 = procCounters()
         let cpu = Double(c1 - c0)
         results.append(RunResult(cpuPct: cpu / audioNS * 100,
                                  procPct: Double(p1 - p0) / audioNS * 100,
-                                 wallPct: Double(w1 - w0) / audioNS * 100,
+                                 kInstrPerCallback: Double(k1.instructions - k0.instructions) / Double(blocks) / 1000,
+                                 milliwatts: Double(k1.energyNJ - k0.energyNJ) / audioNS * 1000,
                                  usPerCallback: cpu / Double(blocks) / 1000))
     }
     let sorted = results.sorted { $0.cpuPct < $1.cpuPct }
@@ -277,6 +300,16 @@ func db(_ x: Double) -> String { x > 0 ? String(format: "%.1f", 20 * log10(x)) :
 
 pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
 if let secs = optLive { runLive(seconds: secs, io: optLiveIO, pollHz: optLivePollHz); exit(0) }
+if let secs = optProxy {
+    // --filter selects the bench case whose config + signal the proxy renders (default "default").
+    let k = allCases.first { $0.name == (optFilter.first ?? "default") } ?? allCases[0]
+    var cfg = SpatialConfig(); k.tweak(&cfg)
+    print("proxy case: \(k.name)")
+    runLiveOutputProxy(seconds: secs, io: optLiveIO, render: optProxyRender, config: cfg) { frames, rate in
+        makeSignal(k.signal, channels: 2, frames: frames, rate: rate)
+    }
+    exit(0)
+}
 let cases = allCases.filter(selected)
 if optList { for k in allCases { print(k.name) }; exit(0) }
 if cases.isEmpty { print("no case matches"); exit(2) }
@@ -328,14 +361,14 @@ if let dir = optCompare {
 }
 
 print("EngineBench  seconds/rep=\(optSeconds)  reps=\(optReps)  paced=\(optPaced)  (CPU = % of one core at real time, median of reps)")
-print("case                              path        rate   io     cpu%    min%    proc%   us/cb   x-realtime")
+print("case                              path        rate   io     cpu%    min%    proc%   us/cb   kinstr/cb  mW(proc)  x-realtime")
 for k in cases {
     do {
         let (m, lo) = try measure(k)
         print(k.name.padding(toLength: 34, withPad: " ", startingAt: 0)
               + k.path.rawValue.padding(toLength: 12, withPad: " ", startingAt: 0)
-              + String(format: "%-7.0f%-7u%-8.3f%-8.3f%-8.3f%-8.2f%.0f", k.rate, k.io, m.cpuPct, lo.cpuPct,
-                       m.procPct, m.usPerCallback, 100 / max(m.cpuPct, 1e-9)))
+              + String(format: "%-7.0f%-7u%-8.3f%-8.3f%-8.3f%-8.2f%-11.1f%-10.3f%.0f", k.rate, k.io, m.cpuPct, lo.cpuPct,
+                       m.procPct, m.usPerCallback, m.kInstrPerCallback, m.milliwatts, 100 / max(m.cpuPct, 1e-9)))
     } catch {
         print("\(k.name): FAILED \(error)")
     }

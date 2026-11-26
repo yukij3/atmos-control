@@ -2,7 +2,7 @@
 // path. Costs the offline bench cannot see: HAL aggregate/tap work on the IO thread, the
 // IO wake-up rate actually negotiated, OS head-tracking work inside AUSpatialMixer.
 
-import SpatialEngine
+@_spi(Bench) import SpatialEngine
 import CoreAudio
 import Foundation
 import Darwin
@@ -115,4 +115,95 @@ func runLive(seconds: Double, io: UInt32?, pollHz: Double) {
             print(String(format: "  %7.3f%%  %@", d / wall * 100, t.name))
         }
     }
+}
+
+// MARK: - Output-only IO proxy (no tap, no capture consent needed)
+//
+// Runs an IOProc directly on the default output device. Each cycle renders the real
+// engine (OfflineRenderer, Personalized-path graph) on synthetic programme into scratch
+// and writes SILENCE to the device — so it is inaudible. Measures what the offline bench
+// cannot: HAL IO-thread overhead + wake-ups at the negotiated buffer size. It does NOT
+// include the process tap / aggregate work (that needs audio-capture consent).
+
+final class ProxyState {
+    let renderer: OfflineRenderer?
+    let input: UnsafeMutablePointer<Float>
+    let scratch: UnsafeMutablePointer<Float>
+    let frames: Int
+    var pos = 0
+    var callbacks = 0
+    init(renderer: OfflineRenderer?, input: UnsafeMutablePointer<Float>, frames: Int, maxIO: Int) {
+        self.renderer = renderer; self.input = input; self.frames = frames
+        scratch = .allocate(capacity: maxIO * 2); scratch.initialize(repeating: 0, count: maxIO * 2)
+    }
+}
+
+nonisolated(unsafe) let proxyIOProc: AudioDeviceIOProc = { _, _, _, _, outputData, _, clientData in
+    guard let clientData else { return noErr }
+    let st = Unmanaged<ProxyState>.fromOpaque(clientData).takeUnretainedValue()
+    let outs = UnsafeMutableAudioBufferListPointer(outputData)
+    guard outs.count > 0 else { return noErr }
+    let ch = max(Int(outs[0].mNumberChannels), 1)
+    let n = Int(outs[0].mDataByteSize) / (4 * ch)
+    if let r = st.renderer, n > 0 {
+        if st.pos + n > st.frames { st.pos = 0 }
+        r.render(input: st.input + st.pos * 2, output: st.scratch, frames: UInt32(n))
+        st.pos += n
+    }
+    var b = 0
+    while b < outs.count { if let p = outs[b].mData { memset(p, 0, Int(outs[b].mDataByteSize)) }; b += 1 }
+    st.callbacks += 1
+    return noErr
+}
+
+func runLiveOutputProxy(seconds: Double, io: UInt32?, render: Bool, config: SpatialConfig,
+                        input: (Int, Double) -> UnsafeMutablePointer<Float>) {
+    let out = SpatialEngine.currentDefaultOutput()
+    if let io {
+        var v = io
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyBufferFrameSize,
+                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        print("set buffer \(io): status \(AudioObjectSetPropertyData(out.id, &a, 0, nil, 4, &v))")
+    }
+    let rate = rateProp(out.id)
+    let buf = u32Prop(out.id, kAudioDevicePropertyBufferFrameSize) ?? 512
+    print("PROXY: [\(out.id)] \(out.name) @ \(Int(rate)) Hz, IO buffer \(buf), render=\(render)")
+    let engine = SpatialEngine()
+    engine.config = config
+    let renderer = render ? try? OfflineRenderer(engine: engine, path: .unifiedTap, sampleRate: rate, ioFrames: buf) : nil
+    let frames = Int(rate) * 4
+    let state = ProxyState(renderer: renderer, input: input(frames, rate), frames: frames, maxIO: 8192)
+    var proc: AudioDeviceIOProcID?
+    guard AudioDeviceCreateIOProcID(out.id, proxyIOProc, Unmanaged.passUnretained(state).toOpaque(), &proc) == noErr,
+          let proc, AudioDeviceStart(out.id, proc) == noErr else { print("proxy IOProc failed"); return }
+    Thread.sleep(forTimeInterval: 1.0)
+    var ru0 = rusage(); getrusage(RUSAGE_SELF, &ru0)
+    let th0 = Dictionary(threadSamples().map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    let cb0 = state.callbacks
+    let k0 = procCounters()
+    let w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    Thread.sleep(forTimeInterval: seconds)
+    let w1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    let k1 = procCounters()
+    let cb1 = state.callbacks
+    var ru1 = rusage(); getrusage(RUSAGE_SELF, &ru1)
+    let th1 = threadSamples()
+    AudioDeviceStop(out.id, proc)
+    AudioDeviceDestroyIOProcID(out.id, proc)
+    let wall = Double(w1 - w0)
+    func ns(_ t: timeval) -> Double { Double(t.tv_sec) * 1e9 + Double(t.tv_usec) * 1e3 }
+    let procCPU = (ns(ru1.ru_utime) + ns(ru1.ru_stime)) - (ns(ru0.ru_utime) + ns(ru0.ru_stime))
+    let secs = wall / 1e9
+    print(String(format: "callbacks/s %.1f  process CPU %.3f%%  Minstr/s %.2f  kinstr/cb %.1f  energy %.3f mW  pkgIdleWake/s %.0f  intrWake/s %.0f",
+                 Double(cb1 - cb0) / secs, procCPU / wall * 100,
+                 Double(k1.instructions - k0.instructions) / secs / 1e6,
+                 Double(k1.instructions - k0.instructions) / Double(max(cb1 - cb0, 1)) / 1000,
+                 Double(k1.energyNJ - k0.energyNJ) / secs / 1e6,
+                 Double(k1.idleWakeups - k0.idleWakeups) / secs, Double(k1.intrWakeups - k0.intrWakeups) / secs))
+    for t in th1 {
+        let d = Double(t.cpuNS - (th0[t.id]?.cpuNS ?? 0))
+        if d / wall * 100 >= 0.005 { print(String(format: "  %7.3f%%  %@", d / wall * 100, t.name)) }
+    }
+    withExtendedLifetime(state) {}
+    withExtendedLifetime(renderer) {}
 }
