@@ -34,6 +34,14 @@ let package = Package(
             dependencies: ["SpatialEngine"],
             path: "Sources/AtmosDaemon"
         ),
+        // Offline CPU benchmark + null-test regression harness over the real render path
+        // (same mixer graph + RT callbacks, synthetic input, no device IO).
+        // `swift run -c release EngineBench [--filter x] [--record dir | --compare dir]`.
+        .executableTarget(
+            name: "EngineBench",
+            dependencies: ["SpatialEngine"],
+            path: "Sources/EngineBench"
+        ),
         // Phase 3: SwiftUI menu-bar control app. Hosts the engine in-process; the
         // binary is wrapped into atmos-control.app by App/build-app.sh (LSUIElement).
         .executableTarget(

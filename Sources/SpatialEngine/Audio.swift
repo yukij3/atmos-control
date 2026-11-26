@@ -350,9 +350,18 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
     while b < ch { abl[b].mDataByteSize = n * 4; b &+= 1 }
     let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, n, abl.unsafeMutablePointer)
     if status != noErr { return status }
+    processCapturedBlock(ctx, abl: abl, frames: n)
+    return noErr
+}
+
+/// Capture-side post-processing shared by the loopback capture callback and the offline
+/// bench harness: push the rendered capture planes into the ring + update the meters.
+@inline(__always)
+func processCapturedBlock(_ ctx: Ctx, abl: UnsafeMutableAudioBufferListPointer, frames n: UInt32) {
     let written = ctx.ring.writeAll(from: abl, frameCount: n)
     ctx.totalCaptured &+= UInt64(written)
     // Per-channel peak (raw loop + fabsf — no Swift runtime calls on the RT thread).
+    let ch = ctx.channels
     let cnt = Int(n)
     var c = 0
     while c < ch {
@@ -365,7 +374,6 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
         }
         c &+= 1
     }
-    return noErr
 }
 
 // Sole ring consumer in spatialize mode (runs inside AudioUnitRender on the

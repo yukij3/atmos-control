@@ -169,7 +169,7 @@ public enum SpatialEngineError: Error, CustomStringConvertible {
 // MARK: - Engine
 
 public final class SpatialEngine: @unchecked Sendable {
-    public private(set) var isRunning = false
+    public internal(set) var isRunning = false
     public var config = SpatialConfig()
     /// Optional setup logger (verbose property-set trace). nil = silent.
     public var logger: ((String) -> Void)? = nil
@@ -178,10 +178,10 @@ public final class SpatialEngine: @unchecked Sendable {
     /// on a private queue; the owner serializes any rebuild or teardown on its own queue.
     public var onFormatChange: (() -> Void)? = nil
 
-    private var ctx: Ctx?
+    var ctx: Ctx?                              // internal: shared with the offline bench harness
     private var outputDeviceID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
     private var startedCaptureID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)  // capture device resolved at start()
-    private var activeSourceMode: SourceRenderMode = .dualPointStereo
+    var activeSourceMode: SourceRenderMode = .dualPointStereo
     private let activeUnifiedDeviceID = Atomic<UInt32>(UInt32(kAudioObjectUnknown))
     private let sessionToken = Atomic<UInt64>(0)
     private var formatListeners: [(AudioDeviceID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
@@ -359,54 +359,11 @@ public final class SpatialEngine: @unchecked Sendable {
 
         // --- Spatial mixer ---
         if config.spatialize {
-            let mode = effectiveMode
-            let spatialMax = max(playMax, ctx.captureBufSize, 4096)
-            ctx.spatialBed = (mode == .ambienceBedStereo)
-            ctx.spatialDualPoint = mode.isDualPoint
-            ctx.spatialSurround = mode.isSurround
-            ctx.spatialSurroundBed = mode.isSurroundBed
-            var renderFlags: UInt32 = 0
-            if config.interauralDelay { renderFlags |= kRenderFlagInterAuralDelay }
-            if config.distanceAttenuation { renderFlags |= kRenderFlagDistanceAtten }
-            let dp = DistanceParams(referenceDistance: config.distanceRef,
-                                    maxDistance: config.distanceMax,
-                                    maxAttenuation: config.distanceMaxAtten)
-            guard let mixer = makeSpatialMixer(
-                ctxPtr: ctxPtr, maxFrames: spatialMax, mode: mode,
-                algo: config.algorithm.rawValue, algoName: config.algorithm.label,
-                outputType: config.outputType.rawValue, outputTypeName: config.outputType.label,
-                hrtfMode: config.hrtfMode.rawValue, hrtfModeName: config.hrtfMode.label,
-                headTrack: config.headTracking ? 1 : 0,
-                inputSampleRate: captureRate,
-                outputSampleRate: unifiedTap ? captureRate : 48_000,
-                renderFlags: renderFlags, distanceParams: dp,
-                attenCurve: config.attenuationCurve.rawValue,
-                reverbEnabled: reverbActive, reverbRoomType: config.reverbRoomType.rawValue) else {
+            guard installSpatialMixer(ctx: ctx, ctxPtr: ctxPtr, mode: effectiveMode,
+                                      captureChannels: captureChannels, captureRate: captureRate,
+                                      outputRate: unifiedTap ? captureRate : 48_000, playMax: playMax) else {
                 teardown(); throw SpatialEngineError.setupFailed("spatial mixer")
             }
-            let dmL = UnsafeMutablePointer<Float>.allocate(capacity: Int(spatialMax))
-            let dmR = UnsafeMutablePointer<Float>.allocate(capacity: Int(spatialMax))
-            dmL.initialize(repeating: 0, count: Int(spatialMax))
-            dmR.initialize(repeating: 0, count: Int(spatialMax))
-            ctx.dmL = dmL; ctx.dmR = dmR
-            // Surround staging: one plane per capture channel, filled once per render cycle.
-            if mode.isSurround || mode.isSurroundBed {
-                let stage = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: captureChannels)
-                var c = 0
-                while c < captureChannels {
-                    let p = UnsafeMutablePointer<Float>.allocate(capacity: Int(spatialMax))
-                    p.initialize(repeating: 0, count: Int(spatialMax))
-                    stage[c] = p
-                    c += 1
-                }
-                ctx.stage = stage
-                ctx.stageChannels = captureChannels
-            }
-            ctx.spatialMaxFrames = spatialMax
-            ctx.spatialMixer = mixer
-            applySourceParams(mixer: mixer, mode: mode)
-            applyReverbParams(mixer: mixer, mode: mode)
-            ctx.spatialize = true   // publish last
         }
 
         if unifiedTap {
@@ -475,6 +432,61 @@ public final class SpatialEngine: @unchecked Sendable {
         isRunning = false
     }
 
+    /// Build + publish the AUSpatialMixer and its staging buffers into `ctx`. Shared by
+    /// `start()` and the offline bench harness so both render through the same graph.
+    func installSpatialMixer(ctx: Ctx, ctxPtr: UnsafeMutableRawPointer, mode: SourceRenderMode,
+                             captureChannels: Int, captureRate: Double, outputRate: Double,
+                             playMax: UInt32) -> Bool {
+        let spatialMax = max(playMax, ctx.captureBufSize, 4096)
+        ctx.spatialBed = (mode == .ambienceBedStereo)
+        ctx.spatialDualPoint = mode.isDualPoint
+        ctx.spatialSurround = mode.isSurround
+        ctx.spatialSurroundBed = mode.isSurroundBed
+        var renderFlags: UInt32 = 0
+        if config.interauralDelay { renderFlags |= kRenderFlagInterAuralDelay }
+        if config.distanceAttenuation { renderFlags |= kRenderFlagDistanceAtten }
+        let dp = DistanceParams(referenceDistance: config.distanceRef,
+                                maxDistance: config.distanceMax,
+                                maxAttenuation: config.distanceMaxAtten)
+        guard let mixer = makeSpatialMixer(
+            ctxPtr: ctxPtr, maxFrames: spatialMax, mode: mode,
+            algo: config.algorithm.rawValue, algoName: config.algorithm.label,
+            outputType: config.outputType.rawValue, outputTypeName: config.outputType.label,
+            hrtfMode: config.hrtfMode.rawValue, hrtfModeName: config.hrtfMode.label,
+            headTrack: config.headTracking ? 1 : 0,
+            inputSampleRate: captureRate,
+            outputSampleRate: outputRate,
+            renderFlags: renderFlags, distanceParams: dp,
+            attenCurve: config.attenuationCurve.rawValue,
+            reverbEnabled: reverbActive, reverbRoomType: config.reverbRoomType.rawValue) else {
+            return false
+        }
+        let dmL = UnsafeMutablePointer<Float>.allocate(capacity: Int(spatialMax))
+        let dmR = UnsafeMutablePointer<Float>.allocate(capacity: Int(spatialMax))
+        dmL.initialize(repeating: 0, count: Int(spatialMax))
+        dmR.initialize(repeating: 0, count: Int(spatialMax))
+        ctx.dmL = dmL; ctx.dmR = dmR
+        // Surround staging: one plane per capture channel, filled once per render cycle.
+        if mode.isSurround || mode.isSurroundBed {
+            let stage = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: captureChannels)
+            var c = 0
+            while c < captureChannels {
+                let p = UnsafeMutablePointer<Float>.allocate(capacity: Int(spatialMax))
+                p.initialize(repeating: 0, count: Int(spatialMax))
+                stage[c] = p
+                c += 1
+            }
+            ctx.stage = stage
+            ctx.stageChannels = captureChannels
+        }
+        ctx.spatialMaxFrames = spatialMax
+        ctx.spatialMixer = mixer
+        applySourceParams(mixer: mixer, mode: mode)
+        applyReverbParams(mixer: mixer, mode: mode)
+        ctx.spatialize = true   // publish last
+        return true
+    }
+
     private func resolveUnifiedOutput(requested: AudioDeviceID?, aggregateID: AudioDeviceID) throws -> AudioDeviceID {
         let mainID = aggregateMainSubDeviceUID(aggregateID).flatMap { deviceID(forUID: $0) }
         if let r = requested, r != AudioDeviceID(kAudioObjectUnknown) {
@@ -501,7 +513,7 @@ public final class SpatialEngine: @unchecked Sendable {
         throw SpatialEngineError.noOutputDevice
     }
 
-    private func teardown() {
+    func teardown() {
         _ = sessionToken.wrappingAdd(1, ordering: .releasing)
         removeFormatListeners()
         activeUnifiedDeviceID.store(UInt32(kAudioObjectUnknown), ordering: .releasing)
@@ -654,7 +666,7 @@ public final class SpatialEngine: @unchecked Sendable {
 
     /// The internal reverb wet path only renders under HRTF/HRTF-HQ; under
     /// Use Output Type it is inert and ReverbBlend would only attenuate the dry path.
-    private var reverbActive: Bool { config.reverbEnabled && config.algorithm != .useOutputType }
+    var reverbActive: Bool { config.reverbEnabled && config.algorithm != .useOutputType }
 
     private func applySourceParams(mixer: AudioUnit, mode: SourceRenderMode) {
         // Below ~0.2 m the UseOutputType renderer collapses the stereo image back into
