@@ -87,10 +87,14 @@ pub struct Engine {
 
 unsafe extern "C" fn trampoline(context: *mut c_void) {
     // SAFETY: `context` is the address of a `Box<dyn Fn()>` owned by `Inner` and unregistered
-    // before it is dropped (see `Engine::set_on_change`). Runs on the main thread. A panic here
-    // aborts (extern "C" doesn't unwind).
+    // before it is dropped (see `Engine::set_on_change`). Runs on the main thread.
     let hook = unsafe { &*(context as *const Hook) };
-    hook();
+    // A panic must not unwind into Swift (extern "C" would abort on the spot, skipping the
+    // on-quit cleanup and leaving a loopback mode's system output on the virtual device).
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)).is_err() {
+        real::shutdown_core();
+        std::process::abort();
+    }
 }
 
 impl Engine {

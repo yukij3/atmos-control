@@ -65,6 +65,10 @@ fn main() {
     // stop the engine, destroy the tap, restore the default output. Rune ends the process
     // right after it, so nothing after `run` would run.
     rune::fast_exit(atmos_core::shutdown_process_engine);
+    // A panic in a UI callback ends the event loop without the quit hooks (`fast_exit` doesn't
+    // run); Rune re-raises it out of `run_windows_with`. Run the cleanup while it unwinds, or a
+    // loopback mode leaves the system output on the virtual device (all audio silent).
+    let _cleanup_on_panic = CleanupOnPanic;
 
     rune::run_windows_with(RunOptions { accessory: true }, move |_displays| {
         let (engine, note) = Engine::select(&args, headless);
@@ -154,6 +158,18 @@ fn main() {
             WindowSpec::from_app("settings", settings_app).boxed(),
         ]
     });
+}
+
+/// Runs the engine's on-quit cleanup when dropped by a panic unwinding out of `main` (main
+/// thread, after Rune's event loop has stopped).
+struct CleanupOnPanic;
+
+impl Drop for CleanupOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            atmos_core::shutdown_process_engine();
+        }
+    }
 }
 
 /// `ATMOS_OPEN_PANEL=1` (development): open the panel once the menu-bar item has a frame to
