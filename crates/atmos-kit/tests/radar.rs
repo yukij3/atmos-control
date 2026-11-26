@@ -81,6 +81,31 @@ fn keys_step_azimuth_and_distance() {
 }
 
 #[test]
+fn escape_mid_drag_restores_the_position_from_before_the_drag() {
+    // The view rebuilds after every edit (as the app's does), so the drag handler that sees the
+    // cancel is one built from an already-dragged position.
+    let mut rt = runtime();
+    let (cx, cy) = rt.find("radar").expect("radar");
+    let geo = RadarGeometry::large();
+    let before = rt.state.stage;
+    // Press at −90° on the 2 m ring, drag to 180° on the 4 m ring, then Escape.
+    rt.pointer_down(cx - geo.scale.rho(2.0), cy);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(cx, cy + geo.scale.rho(4.0));
+    rt.frame(1.0 / 60.0);
+    rt.key(KeyEvent { key: Key::Escape, mods: Mods::default() });
+    rt.frame(1.0 / 60.0);
+
+    let last = *rt.state.edits.last().expect("edits");
+    assert_eq!(last.phase, EditPhase::Cancel, "{:?}", rt.state.edits);
+    assert!(
+        (last.azimuth - before.azimuth).abs() < 0.5 && (last.distance - before.distance).abs() < 0.01,
+        "cancel restored az {} d {}, expected the pre-drag az {} d {}",
+        last.azimuth, last.distance, before.azimuth, before.distance
+    );
+}
+
+#[test]
 fn assistive_technology_reads_the_position() {
     let rt = runtime();
     let json = rt.accessibility_json().to_string();
