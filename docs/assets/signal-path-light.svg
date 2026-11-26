@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 260" width="980" height="260" role="img" aria-labelledby="t d">
+  <title id="t">atmos-control signal path</title>
+  <desc id="d">System audio is captured either by a process tap (Personalized mode, no driver, personalized HRTF) or through the atmos-control virtual device (Surround 7.1.4 and Stereo modes, needs the driver, generic HRTF). Both feed Apple's AUSpatialMixer, which also takes AirPods head pose, and the binaural result plays on your headphones.</desc>
+  <style>
+    text{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Helvetica,Arial,sans-serif;fill:#59636E;font-size:14px}
+    .t{fill:#1F2328;font-size:16px;font-weight:600}
+    .m{font-family:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace}
+    .box{fill:none;stroke:#C9D1D9;stroke-width:1}
+    .hot{fill:none;stroke:#1F9EA9;stroke-width:1.5}
+    .wire{fill:none;stroke:#59636E;stroke-width:1.25;stroke-linejoin:round}
+    .dash{stroke-dasharray:3 4}
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M1 1.5 L9 5 L1 8.5" fill="none" stroke="#59636E" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- source -->
+  <rect class="box" x="20.5" y="100.5" width="170" height="60" rx="8"/>
+  <text class="t" x="105" y="126" text-anchor="middle">System audio</text>
+  <text x="105" y="146" text-anchor="middle">every app</text>
+
+  <!-- capture: process tap -->
+  <rect class="box" x="250.5" y="22.5" width="234" height="76" rx="8"/>
+  <text class="t" x="268" y="48">Process tap</text>
+  <text x="268" y="68">Personalized mode · no driver</text>
+  <circle cx="272" cy="83.5" r="4" fill="#1F9EA9"/>
+  <text x="283" y="88">personalized HRTF</text>
+
+  <!-- capture: virtual device -->
+  <rect class="box" x="250.5" y="161.5" width="234" height="76" rx="8"/>
+  <text class="t" x="268" y="187">Virtual device</text>
+  <text x="268" y="207">Surround 7.1.4, Stereo · driver</text>
+  <circle cx="272" cy="222.5" r="3.5" fill="none" stroke="#59636E" stroke-width="1.25"/>
+  <text x="283" y="227">generic HRTF</text>
+
+  <!-- renderer -->
+  <rect class="hot" x="560.5" y="95.5" width="200" height="70" rx="8"/>
+  <text class="t m" x="660.5" y="125" text-anchor="middle">AUSpatialMixer</text>
+  <text x="660.5" y="146" text-anchor="middle">binaural render</text>
+
+  <!-- head pose -->
+  <text x="660.5" y="30" text-anchor="middle">AirPods head pose</text>
+  <path class="wire dash" d="M660.5 40 V90" marker-end="url(#a)"/>
+
+  <!-- output -->
+  <rect class="box" x="820.5" y="100.5" width="140" height="60" rx="8"/>
+  <text class="t" x="890.5" y="126" text-anchor="middle">Headphones</text>
+  <text x="890.5" y="146" text-anchor="middle">binaural</text>
+
+  <!-- wires -->
+  <path class="wire" d="M191 130.5 H220.5 V60.5 H245" marker-end="url(#a)"/>
+  <path class="wire" d="M220.5 130.5 V199.5 H245" marker-end="url(#a)"/>
+  <path class="wire" d="M485 60.5 H522.5 V118.5 H555" marker-end="url(#a)"/>
+  <path class="wire" d="M485 199.5 H522.5 V142.5 H555" marker-end="url(#a)"/>
+  <path class="wire" d="M761 130.5 H815" marker-end="url(#a)"/>
+</svg>
