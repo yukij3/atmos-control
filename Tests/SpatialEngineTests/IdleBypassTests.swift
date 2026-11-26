@@ -60,6 +60,33 @@ final class IdleBypassTests: XCTestCase {
         XCTAssertNil(firstDiff, "bypass changed the output (first diff at sample \(firstDiff ?? -1))", file: file, line: line)
     }
 
+    /// A UI that re-sends unchanged values every tick must not keep the mixer awake;
+    /// a real change must re-arm it.
+    func testNoOpUpdatesKeepBypassEngaged() throws {
+        let engine = SpatialEngine()
+        let r = try OfflineRenderer(engine: engine, path: .unifiedTap, sampleRate: rate, ioFrames: io)
+        var zeros = [Float](repeating: 0, count: Int(io) * 2)
+        var out = [Float](repeating: 0, count: Int(io) * 2)
+        func run(_ blocks: Int, each: () -> Void = {}) {
+            for _ in 0..<blocks {
+                each()
+                zeros.withUnsafeMutableBufferPointer { i in out.withUnsafeMutableBufferPointer { o in
+                    _ = r.render(input: i.baseAddress!, output: o.baseAddress!, frames: io) } }
+            }
+        }
+        run(50)                                                       // > 250 ms of silence
+        let engaged = r.idleSkippedBlocks
+        XCTAssertGreaterThan(engaged, 0)
+        run(50) {
+            engine.updateSource(azimuth: engine.config.azimuth, gain: engine.config.gain)
+            engine.updateReverb(blend: engine.config.reverbBlend)
+            try? engine.reconfigure(engine.config)
+        }
+        XCTAssertEqual(r.idleSkippedBlocks, engaged + 50, "no-op updates re-armed the mixer")
+        run(1) { engine.updateSource(azimuth: 10) }
+        XCTAssertEqual(r.idleSkippedBlocks, engaged + 50, "a real change must render")
+    }
+
     func testUnifiedDualPointIsBitExact() throws { try assertBypassInvisible(path: .unifiedTap) }
     func testUnifiedMonoIsBitExact() throws { try assertBypassInvisible(path: .unifiedTap, mode: .pointSourceMono) }
     func testUnifiedHRTFHQReverbIsBitExact() throws { try assertBypassInvisible(path: .unifiedTap, algorithm: .hrtfHQ) }

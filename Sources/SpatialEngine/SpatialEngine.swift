@@ -664,19 +664,25 @@ public final class SpatialEngine: @unchecked Sendable {
     /// Live-update the source position/gain (safe while running; AudioUnitSetParameter).
     public func updateSource(azimuth: Float? = nil, elevation: Float? = nil, distance: Float? = nil,
                              gain: Float? = nil, width: Float? = nil) {
+        let before = config
         if let a = azimuth { config.azimuth = a }
         if let e = elevation { config.elevation = e }
         if let d = distance { config.distance = min(max(d, 0.35), config.distanceMax) }
         if let g = gain { config.gain = g }
         if let w = width { config.stereoWidth = w }
+        // No-op updates (a UI re-sending unchanged values every tick) must not touch the
+        // mixer: each apply re-arms rendering and would keep the idle bypass from engaging.
+        guard config != before else { return }
         if let mixer = ctx?.spatialMixer { applySourceParams(mixer: mixer, mode: activeSourceMode) }
     }
 
     /// Live-update the internal reverb wet/dry blend + gain (no-op unless the reverb
     /// path is active — see reverbActive). Safe while running.
     public func updateReverb(blend: Float? = nil, gain: Float? = nil) {
+        let before = config
         if let b = blend { config.reverbBlend = b }
         if let g = gain { config.globalReverbGain = g }
+        guard config != before else { return }   // see updateSource
         if let mixer = ctx?.spatialMixer { applyReverbParams(mixer: mixer, mode: activeSourceMode) }
     }
 
@@ -772,6 +778,7 @@ public final class SpatialEngine: @unchecked Sendable {
             config = newConfig
             try start(outputDeviceID: out, captureDeviceID: cap)
         } else {
+            guard newConfig != config else { return }   // see updateSource
             config = newConfig
             if let mixer = ctx?.spatialMixer {
                 applySourceParams(mixer: mixer, mode: activeSourceMode)
