@@ -119,8 +119,12 @@ EOT
 
 # Always build the driver (building is safe and touches nothing privileged).
 info "Building the driver (Driver/build.sh)"
-bash "$REPO_ROOT/Driver/build.sh" >/dev/null 2>&1 || warn "driver build reported issues; see Driver/build.sh output"
-if [ ! -d "$DRIVER_SRC" ]; then
+# A failed build can leave a half-assembled bundle behind (build.sh starts from an empty
+# Contents/MacOS): never let that replace an installed, working driver.
+DRIVER_LOG="$(mktemp -t atmos-driver-build)"
+if ! bash "$REPO_ROOT/Driver/build.sh" >"$DRIVER_LOG" 2>&1; then
+    warn "driver build failed (log: $DRIVER_LOG) — skipping driver install steps."
+elif [ ! -x "$DRIVER_SRC/Contents/MacOS/atmos-control" ]; then
     warn "driver bundle not found at $DRIVER_SRC — skipping driver install steps."
 else
     if [ "$WITH_DRIVER" = "1" ]; then
@@ -134,7 +138,11 @@ else
         fi
         priv sudo cp -R "$DRIVER_SRC" "$DRIVER_DEST"
         priv sudo chown -R root:wheel "$DRIVER_DEST"
-        priv sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+        # kickstart is refused with SIP on (macOS 14.4+); coreaudiod is KeepAlive, so a kill
+        # makes launchd restart it.
+        priv sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null \
+            || priv sudo killall coreaudiod \
+            || fail "driver copied to $DRIVER_DEST, but coreaudiod could not be restarted: restart the Mac to load it."
         info "Driver installed."
     else
         cat <<EOT
@@ -145,6 +153,7 @@ else
         sudo cp -R "$DRIVER_SRC" "$DRIVER_DEST"
         sudo chown -R root:wheel "$DRIVER_DEST"
         sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+        (if that is refused, as with SIP on: sudo killall coreaudiod)
 
     (coreaudiod restart makes audio devices blink for about a second.)
 EOT

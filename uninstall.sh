@@ -58,7 +58,11 @@ if [ "$WITH_DRIVER" = "1" ]; then
     warn "When coreaudiod restarts, your audio devices will blink out for about a second — this is expected."
     info "Removing driver from $HAL_DIR"
     priv sudo rm -rf "$DRIVER_DEST"
-    priv sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+    # kickstart is refused with SIP on (macOS 14.4+); coreaudiod is KeepAlive, so a kill makes
+    # launchd restart it.
+    priv sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null \
+        || priv sudo killall coreaudiod \
+        || warn "coreaudiod could not be restarted: the driver is gone after the next restart of the Mac."
     info "Driver removed."
 else
     cat <<EOT
@@ -67,6 +71,7 @@ else
 
         sudo rm -rf "$DRIVER_DEST"
         sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+        (if that is refused, as with SIP on: sudo killall coreaudiod)
 
     (coreaudiod restart makes audio devices blink for about a second.)
 EOT

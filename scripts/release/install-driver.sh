@@ -38,6 +38,7 @@ echo "  sudo cp -R \"$SRC\" \"$HAL_DIR/\""
 echo "  sudo chown -R root:wheel \"$DEST\""
 echo "  sudo xattr -dr com.apple.quarantine \"$DEST\""
 echo "  sudo launchctl kickstart -k system/com.apple.audio.coreaudiod"
+echo "    (if refused, as with SIP on: sudo killall coreaudiod; launchd restarts it)"
 echo
 [ "$DRY_RUN" = "1" ] && { echo "(dry run, nothing changed)"; exit 0; }
 
@@ -51,7 +52,11 @@ sudo mkdir -p "$HAL_DIR"
 sudo cp -R "$SRC" "$HAL_DIR/"
 sudo chown -R root:wheel "$DEST"
 sudo xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
-sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+# `launchctl kickstart` on coreaudiod is refused with SIP on (macOS 14.4 and later); it is a
+# KeepAlive daemon, so killing it makes launchd start it again with the new driver.
+sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null \
+    || sudo killall coreaudiod \
+    || fail "installed $DEST, but coreaudiod could not be restarted: restart the Mac to load the driver."
 
 echo
 echo "Installed $DEST and restarted coreaudiod."
