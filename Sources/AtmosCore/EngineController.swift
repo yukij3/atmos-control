@@ -967,10 +967,12 @@ final class EngineController {
         return isOn ? .on : .off
     }
 
+    /// At most 31 UTF-8 bytes (ATMOS_STATUS_CAP): longer text is cut in the snapshot, and the
+    /// panel looks for "permission" in the waiting text to offer Privacy & Security.
     var engineStatusText: String {
         switch engineStatus {
         case .off: return "Off"
-        case .starting: return awaitingConsent ? "Waiting for audio-capture permission…" : "Starting…"
+        case .starting: return awaitingConsent ? "Awaiting capture permission…" : "Starting…"
         case .on: return "On"
         case .stopping: return "Stopping…"
         }

@@ -104,7 +104,7 @@ impl Model {
     pub fn new(s: &Snapshot) -> Model {
         let mut notices = Vec::new();
         // A start the engine says more about than "Starting…": a Personalized start blocked on
-        // the macOS audio-capture prompt reads "Waiting for audio-capture permission…" after
+        // the macOS audio-capture prompt reads "Awaiting capture permission…" after
         // 1.5 s (still busy). The engine's own words head the notice.
         let waiting = waiting_detail(s);
         if let Some(text) = &waiting {
@@ -252,7 +252,7 @@ mod tests {
         let waiting = model(MockPreset::AwaitingConsent);
         assert_eq!(waiting.engine.mark, Some(Mark::Busy));
         assert_eq!(waiting.notices.len(), 1);
-        assert_eq!(waiting.notices[0].title, "Waiting for audio-capture permission…");
+        assert_eq!(waiting.notices[0].title, "Awaiting capture permission…");
         assert_eq!(waiting.notices[0].actions, vec![Action::OpenPrivacy]);
     }
 
