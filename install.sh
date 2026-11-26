@@ -77,14 +77,24 @@ if ! command -v swift >/dev/null 2>&1; then
     fail "'swift' not found on PATH. Install the Xcode command line tools: xcode-select --install"
 fi
 
-info "OK: Apple Silicon, macOS $(sw_vers -productVersion), swift present"
+# The UI is Rust (Rune): cargo builds it. rustup's ~/.cargo/bin may be missing from PATH in a
+# non-login shell, so look there too.
+if ! command -v cargo >/dev/null 2>&1 && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]; then
+    PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"; export PATH
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    fail "'cargo' not found. atmos-control's UI is written in Rust. Install Rust with rustup:
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  (see https://rustup.rs), then open a new terminal (or run: . \"\$HOME/.cargo/env\") and run ./install.sh again.
+  The exact toolchain is pinned in rust-toolchain.toml; rustup downloads it on the first build."
+fi
 
-# ── (b) Build the package (release) ─────────────────────────────────────────
-info "Building (swift build -c release)"
-swift build -c release
+info "OK: Apple Silicon, macOS $(sw_vers -productVersion), swift and cargo present"
 
-# ── (c) Build the app bundle into dist/ ─────────────────────────────────────
-info "Assembling the app bundle (App/build-app.sh)"
+# ── (b)+(c) Build the engine (Swift) and the UI (Rust), assemble dist/ ─────
+# App/build-app.sh runs `swift build -c release --product AtmosCore` (the engine dylib) and
+# `cargo build --release` (the UI binary), then assembles and signs the bundle.
+info "Building and assembling the app bundle (App/build-app.sh)"
 bash "$REPO_ROOT/App/build-app.sh" release
 [ -d "$DIST_APP" ] || fail "expected bundle not found: $DIST_APP"
 

@@ -64,7 +64,8 @@ DRIVER="Driver/.build/atmos-control.driver"
 info "Preflight"
 [ "$(uname -s)" = "Darwin" ] || die "macOS only"
 [ "$(uname -m)" = "arm64" ]  || die "build on Apple Silicon (arm64); this Mac is $(uname -m)"
-for tool in swift clang codesign ditto shasum plutil git; do
+atmos_require_cargo
+for tool in swift cargo clang codesign install_name_tool otool lipo ditto shasum plutil git; do
     command -v "$tool" >/dev/null 2>&1 || die "'$tool' not found"
 done
 
@@ -122,6 +123,15 @@ check_bundle() {  # <bundle> <expected executable arch>
         || die "$b: Info.plist version is $v ($bv), expected $VERSION ($ATMOS_BUILD)"
     exe="$b/Contents/MacOS/$(plutil -extract CFBundleExecutable raw "$b/Contents/Info.plist")"
     [ "$(lipo -archs "$exe")" = "$2" ] || die "$exe: architectures are '$(lipo -archs "$exe")', expected '$2'"
+    # Nested code (the app's libAtmosCore.dylib): same arch, and no build-machine paths left.
+    local code
+    while IFS= read -r code; do
+        [ -n "$code" ] && [ -f "$code" ] || continue
+        [ "$(lipo -archs "$code")" = "$2" ] || die "$code: architectures are '$(lipo -archs "$code")', expected '$2'"
+    done < <(atmos_nested_code "$b")
+    if otool -l "$exe" $(atmos_nested_code "$b" | tr '\n' ' ') | grep -A2 LC_RPATH | grep -E '^ +path /(Users|private|var|tmp|Applications)/'; then
+        die "$b: an rpath points into the build machine (see above)"
+    fi
     echo "    version $v ($bv), arch $2"
 }
 info "Verifying signatures and versions"

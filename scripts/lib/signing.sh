@@ -61,20 +61,41 @@ atmos_resolve_identity() {
     fi
 }
 
-# atmos_sign <bundle>  — sign with the resolved identity (no hardened runtime, no timestamp).
+# atmos_sign <path> [identifier]  — sign one bundle or Mach-O with the resolved identity (no
+# hardened runtime, no timestamp). Never --deep: nested code is signed explicitly, inside out.
 atmos_sign() {
-    codesign --force --sign "$SIGN_ARG" --timestamp=none "$1"
+    codesign --force --sign "$SIGN_ARG" --timestamp=none ${2:+--identifier "$2"} "$1"
 }
 
-# atmos_check_signature <bundle>  — strict verify, then confirm the signing authority is
-# exactly the resolved identity (or ad hoc) and that no Apple certificate is in the chain.
-atmos_check_signature() {
-    local path="$1" info out
-    if ! out="$(codesign --verify --deep --strict --verbose=2 "$path" 2>&1)"; then
-        printf '%s\n' "$out" >&2
-        atmos_die "codesign --verify --deep --strict failed for $path"
-    fi
-    printf '%s\n' "$out" | sed 's/^/    /'
+# atmos_nested_code <bundle>  — the nested code in <bundle>/Contents/Frameworks (dylibs and
+# frameworks), one path per line. Signed before the bundle and checked with it.
+atmos_nested_code() {
+    local fw="$1/Contents/Frameworks"
+    [ -d "$fw" ] || return 0
+    find "$fw" -mindepth 1 -maxdepth 1 \( -name '*.dylib' -o -name '*.framework' \) | sort
+}
+
+# atmos_sign_app <bundle>  — sign the nested code first, then the bundle itself (which seals
+# the nested code's signatures into its own). A nested dylib gets a stable identifier
+# (<bundle id>.<name>, e.g. dev.atmoscontrol.app.AtmosCore) instead of codesign's
+# hash-suffixed default.
+atmos_sign_app() {
+    local app="$1" code id name
+    id="$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")"
+    while IFS= read -r code; do
+        [ -n "$code" ] || continue
+        case "$code" in
+            *.dylib) name="$(basename "$code" .dylib)"; atmos_sign "$code" "$id.${name#lib}" ;;
+            *)       atmos_sign "$code" ;;
+        esac
+    done < <(atmos_nested_code "$app")
+    atmos_sign "$app"
+}
+
+# atmos_check_authority <path>  — the signing authority is exactly the resolved identity (or
+# ad hoc) and no Apple certificate is in the chain.
+atmos_check_authority() {
+    local path="$1" info
     info="$(codesign -dvv "$path" 2>&1)"
     if [ "$SIGN_ARG" = "-" ]; then
         printf '%s\n' "$info" | grep -q '^Signature=adhoc$' || atmos_die "$path is not ad-hoc signed"
@@ -88,4 +109,33 @@ atmos_check_signature() {
         atmos_die "$path carries an Apple-issued signature; refusing"
     fi
     printf '%s\n' "$info" | grep -E '^(Identifier|Authority|Signature|TeamIdentifier)=' | sed 's/^/    /'
+}
+
+# atmos_check_signature <bundle>  — strict verify (--deep here only verifies; it covers the
+# nested code), then the authority of the bundle and of each piece of nested code.
+atmos_check_signature() {
+    local path="$1" out code
+    if ! out="$(codesign --verify --deep --strict --verbose=2 "$path" 2>&1)"; then
+        printf '%s\n' "$out" >&2
+        atmos_die "codesign --verify --deep --strict failed for $path"
+    fi
+    printf '%s\n' "$out" | sed 's/^/    /'
+    atmos_check_authority "$path"
+    while IFS= read -r code; do
+        [ -n "$code" ] || continue
+        echo "    nested: ${code#"$path/"}"
+        atmos_check_authority "$code"
+    done < <(atmos_nested_code "$path")
+}
+
+# atmos_require_cargo  — put cargo on PATH (rustup's default ~/.cargo/bin when a non-login
+# shell lacks it) or fail with install instructions. rust-toolchain.toml pins the toolchain;
+# rustup installs it on first use.
+atmos_require_cargo() {
+    if ! command -v cargo >/dev/null 2>&1 && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]; then
+        PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"; export PATH
+    fi
+    command -v cargo >/dev/null 2>&1 || atmos_die "'cargo' not found. The UI is Rust: install it with rustup (https://rustup.rs):
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+then open a new shell (or: . \"\$HOME/.cargo/env\") and run this again."
 }
