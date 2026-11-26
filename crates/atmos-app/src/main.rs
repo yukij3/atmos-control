@@ -21,6 +21,11 @@
 //! ```
 //!
 //! `ATMOS_SELFTEST=power-cycle` runs one logged engine on/off without any window (`selftest`).
+//! `ATMOS_OPEN_PANEL=1` opens the panel once at launch, a window check that needs no click:
+//!
+//! ```sh
+//! ATMOS_ENGINE=mock ATMOS_DEBUG=1 ATMOS_OPEN_PANEL=1 target/release/atmos-control
+//! ```
 
 mod glyph;
 mod panel;
@@ -110,6 +115,7 @@ fn main() {
         }
         if !headless {
             selftest::start(panel_handle.clone());
+            open_panel_on_launch(panel_handle.clone());
         }
         // SIGTERM / SIGINT / SIGHUP quit through the normal path, so the cleanup runs.
         shell.engine.set_on_terminate(move || panel_handle.quit());
@@ -147,5 +153,15 @@ fn main() {
             WindowSpec::from_app("panel", panel_app).configured_options(panel_options).boxed(),
             WindowSpec::from_app("settings", settings_app).boxed(),
         ]
+    });
+}
+
+/// `ATMOS_OPEN_PANEL=1` (development): open the panel once the menu-bar item has a frame to
+/// sit under, as a click on it would. With `ATMOS_DEBUG=1` the shell logs where it opened.
+fn open_panel_on_launch(panel: rune::AppHandle<Panel>) {
+    if std::env::var_os("ATMOS_OPEN_PANEL").is_none_or(|v| v != "1") { return; }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        panel.update(|p, _| p.shell.show_panel());
     });
 }
