@@ -41,13 +41,12 @@ LIB=".build/$CONFIG/$LIB_NAME"
 [ -f "$LIB" ] || atmos_die "library not found: $LIB"
 
 echo "==> cargo build --release --locked -p atmos-app"
-# Link against the Swift configuration just built (the default lookup matches cargo's profile).
-if [ "$CONFIG" = "release" ]; then
-    cargo build --release --locked -p atmos-app
-else
-    ATMOS_CORE_LIB_DIR="$PWD/.build/$CONFIG" cargo build --release --locked -p atmos-app
-fi
-BIN="target/release/$APP_NAME"
+# Link against the Swift configuration just built, whatever the caller's environment says: an
+# inherited ATMOS_CORE_MOCK_ONLY would build a UI without the engine (mock only), an inherited
+# ATMOS_CORE_LIB_DIR would link a different dylib than the one bundled below.
+unset ATMOS_CORE_MOCK_ONLY
+ATMOS_CORE_LIB_DIR="$PWD/.build/$CONFIG" cargo build --release --locked -p atmos-app
+BIN="${CARGO_TARGET_DIR:-target}/release/$APP_NAME"
 [ -f "$BIN" ] || atmos_die "binary not found: $BIN"
 
 echo "==> assembling $APP"
@@ -79,6 +78,8 @@ otool -l "$APP/Contents/MacOS/$APP_NAME" | grep -q '@executable_path/../Framewor
     || atmos_die "$APP_NAME lost its @executable_path/../Frameworks rpath"
 [ "$(otool -D "$APP/Contents/Frameworks/$LIB_NAME" | tail -1)" = "@rpath/$LIB_NAME" ] \
     || atmos_die "$LIB_NAME install name is not @rpath/$LIB_NAME"
+otool -L "$APP/Contents/MacOS/$APP_NAME" | grep -q "^[[:space:]]*@rpath/$LIB_NAME " \
+    || atmos_die "$APP_NAME does not link @rpath/$LIB_NAME (built against the mock engine only?)"
 
 # LSMinimumSystemVersion 26.0 is the supported floor that install.sh enforces and the README
 # states. Package.swift's deployment target (macOS 15.0) only says the code compiles that far
