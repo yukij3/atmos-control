@@ -160,9 +160,10 @@ nonisolated(unsafe) let unifiedTapCallback: AudioDeviceIOProc = {
     _, _, inputData, _, outputData, outputTime, clientData in
     guard let clientData else { return noErr }
     let ctx = Unmanaged<Ctx>.fromOpaque(clientData).takeUnretainedValue()
-    let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
-    let outs = UnsafeMutableAudioBufferListPointer(outputData)
-    guard let input = ctx.captureABL, let rendered = ctx.unifiedOutputABL,
+    let ins = RawABL(inputData)
+    let outs = RawABL(outputData)
+    guard let inputList = ctx.captureList, let renderedList = ctx.unifiedOutputList,
+          case let input = RawABL(inputList), case let rendered = RawABL(renderedList),
           let left = input[0].mData?.assumingMemoryBound(to: Float.self),
           let right = input[1].mData?.assumingMemoryBound(to: Float.self),
           let l = rendered[0].mData?.assumingMemoryBound(to: Float.self),
@@ -221,7 +222,7 @@ nonisolated(unsafe) let unifiedTapCallback: AudioDeviceIOProc = {
 
     if ctx.spatialize, let mixer = ctx.spatialMixer {
         var flags = AudioUnitRenderActionFlags()
-        let status = renderMixerGated(ctx, mixer, &flags, outputTime, n, rendered.unsafeMutablePointer,
+        let status = renderMixerGated(ctx, mixer, &flags, outputTime, n, renderedList,
                                       inputSilent: peakL == 0 && peakR == 0, ringPeek: nil)
         ctx.totalPlayed &+= UInt64(n)
         guard status == noErr else { zeroBuffers(outs); return status }
@@ -256,7 +257,7 @@ nonisolated(unsafe) let unifiedTapCallback: AudioDeviceIOProc = {
 /// Zero every output buffer except the (up to two) the layout writes — device streams the
 /// layout does not drive must still be silenced each cycle.
 @inline(__always)
-private func zeroBuffers(_ abl: UnsafeMutableAudioBufferListPointer, except a: Int, _ b: Int) {
+private func zeroBuffers(_ abl: RawABL, except a: Int, _ b: Int) {
     var i = 0
     while i < abl.count {
         if i != a && i != b, let p = abl[i].mData { memset(p, 0, Int(abl[i].mDataByteSize)) }

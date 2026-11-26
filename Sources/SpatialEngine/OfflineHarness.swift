@@ -97,7 +97,7 @@ import Darwin
             while i < count { dst[i] = input[i * ch + c]; i += 1 }
             cap[c].mDataByteSize = n * 4
         }
-        processCapturedBlock(ctx, abl: cap, frames: n)
+        processCapturedBlock(ctx, abl: RawABL(cap.unsafeMutablePointer), frames: n)
         outABL[0].mDataByteSize = n * 4
         outABL[1].mDataByteSize = n * 4
         var flags = AudioUnitRenderActionFlags()

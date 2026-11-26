@@ -186,7 +186,7 @@ final class RingBuffer {
     /// Producer: copy `frameCount` frames from the N non-interleaved buffers of `abl`
     /// (abl[c].mData) into the N ring planes. Capture RT thread only.
     @inline(__always) @discardableResult
-    func writeAll(from abl: UnsafeMutableAudioBufferListPointer, frameCount: UInt32) -> UInt32 {
+    func writeAll(from abl: RawABL, frameCount: UInt32) -> UInt32 {
         let wi = writeIdx.load(ordering: .relaxed)
         let ri = readIdx.load(ordering: .acquiring)
         let available = kRingFrames &- (wi &- ri)
@@ -292,6 +292,32 @@ final class RingBuffer {
 }
 
 // ---------------------------------------------------------------------------
+// MARK: - RawABL: inlinable AudioBufferList view for the RT callbacks
+// ---------------------------------------------------------------------------
+
+/// Byte offset of `AudioBufferList.mBuffers` (UInt32 count + 4 bytes padding before the
+/// 8-byte-aligned AudioBuffer array). Asserted against MemoryLayout in the tests.
+let kAudioBufferListBuffersOffset = 8
+
+/// A plain-pointer view of an AudioBufferList. The SDK's UnsafeMutableAudioBufferListPointer
+/// is a resilient CoreAudio-overlay type: every `count`/subscript is a cross-module accessor
+/// call, Optionals of it go through value witnesses, and each call site resolves its type
+/// metadata on first use — all on the IO thread. This compiles to direct loads/stores.
+struct RawABL {
+    let list: UnsafeMutablePointer<AudioBufferList>
+    @inline(__always) init(_ p: UnsafeMutablePointer<AudioBufferList>) { list = p }
+    @inline(__always) init(_ p: UnsafePointer<AudioBufferList>) { list = UnsafeMutablePointer(mutating: p) }
+    @inline(__always) var count: Int { Int(list.pointee.mNumberBuffers) }
+    @inline(__always) var buffers: UnsafeMutablePointer<AudioBuffer> {
+        (UnsafeMutableRawPointer(list) + kAudioBufferListBuffersOffset).assumingMemoryBound(to: AudioBuffer.self)
+    }
+    @inline(__always) subscript(i: Int) -> AudioBuffer {
+        get { buffers[i] }
+        nonmutating set { buffers[i] = newValue }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MARK: - Vector helpers (Accelerate; RT-safe: no allocation, no locks)
 // ---------------------------------------------------------------------------
 
@@ -312,7 +338,7 @@ func isDigitalSilence(_ p: UnsafePointer<Float>, _ n: Int) -> Bool {
 }
 
 @inline(__always)
-func zeroBuffers(_ abl: UnsafeMutableAudioBufferListPointer) {
+func zeroBuffers(_ abl: RawABL) {
     var b = 0
     while b < abl.count { if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }; b &+= 1 }
 }
@@ -326,13 +352,13 @@ final class Ctx: @unchecked Sendable {
     let ring: RingBuffer
     var unifiedDeviceID: AudioDeviceID = 0
     var unifiedIOProc: AudioDeviceIOProcID? = nil
-    var unifiedOutputABL: UnsafeMutableAudioBufferListPointer? = nil
+    var unifiedOutputList: UnsafeMutablePointer<AudioBufferList>? = nil   // RT reads this
     var unifiedLayout: UnifiedBufferLayout = .defaultStereoInterleaved
     var captureUnit:  AudioUnit? = nil
     var playbackUnit: AudioUnit? = nil
     var totalCaptured: UInt64 = 0
     var totalPlayed:   UInt64 = 0
-    var captureABL: UnsafeMutableAudioBufferListPointer? = nil
+    var captureList: UnsafeMutablePointer<AudioBufferList>? = nil         // RT reads this
     var captureBufSize: UInt32 = 0
     // Per-channel peak (max |sample|) since last poll, one Float per capture channel.
     // Written on the capture RT thread, read+reset on the main thread — aligned Float
@@ -368,8 +394,22 @@ final class Ctx: @unchecked Sendable {
     var feedSilence = false                       // input callback feeds zeros (catch-up render)
     let paramEpoch = Atomic<UInt32>(0)            // bumped by the control thread
     var seenParamEpoch: UInt32 = 0
-    var scratchABL: UnsafeMutableAudioBufferListPointer? = nil   // catch-up render target
+    var scratchList: UnsafeMutablePointer<AudioBufferList>? = nil  // catch-up render target
     var idleSkippedBlocks: UInt64 = 0             // telemetry (bench)
+
+    // Setup-thread / test conveniences over the raw lists (never used on the RT threads).
+    var captureABL: UnsafeMutableAudioBufferListPointer? {
+        get { captureList.map { UnsafeMutableAudioBufferListPointer($0) } }
+        set { captureList = newValue?.unsafeMutablePointer }
+    }
+    var unifiedOutputABL: UnsafeMutableAudioBufferListPointer? {
+        get { unifiedOutputList.map { UnsafeMutableAudioBufferListPointer($0) } }
+        set { unifiedOutputList = newValue?.unsafeMutablePointer }
+    }
+    var scratchABL: UnsafeMutableAudioBufferListPointer? {
+        get { scratchList.map { UnsafeMutableAudioBufferListPointer($0) } }
+        set { scratchList = newValue?.unsafeMutablePointer }
+    }
 
     init(channels: Int) {
         self.channels = channels
@@ -430,7 +470,8 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
     inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, _
 ) -> OSStatus in
     let ctx = Unmanaged<Ctx>.fromOpaque(inRefCon).takeUnretainedValue()
-    guard let unit = ctx.captureUnit, let abl = ctx.captureABL else { return noErr }
+    guard let unit = ctx.captureUnit, let list = ctx.captureList else { return noErr }
+    let abl = RawABL(list)
     let n = inNumberFrames
     // The ABL blocks were allocated once for captureBufSize (MaximumFramesPerSlice at
     // setup). If the HAL delivers a larger slice mid-session (device IO buffer grown in
@@ -439,7 +480,7 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
     let ch = ctx.channels
     var b = 0
     while b < ch { abl[b].mDataByteSize = n * 4; b &+= 1 }
-    let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, n, abl.unsafeMutablePointer)
+    let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, n, list)
     if status != noErr { return status }
     processCapturedBlock(ctx, abl: abl, frames: n)
     return noErr
@@ -448,7 +489,7 @@ nonisolated(unsafe) let captureInputCallback: AURenderCallback = { (
 /// Capture-side post-processing shared by the loopback capture callback and the offline
 /// bench harness: push the rendered capture planes into the ring + update the meters.
 @inline(__always)
-func processCapturedBlock(_ ctx: Ctx, abl: UnsafeMutableAudioBufferListPointer, frames n: UInt32) {
+func processCapturedBlock(_ ctx: Ctx, abl: RawABL, frames n: UInt32) {
     let written = ctx.ring.writeAll(from: abl, frameCount: n)
     ctx.totalCaptured &+= UInt64(written)
     // Per-channel peak (vDSP_maxmgv — no Swift runtime calls on the RT thread).
@@ -486,7 +527,7 @@ func renderMixerGated(_ ctx: Ctx, _ mixer: AudioUnit,
     if ctx.idleBypassing {
         if inputSilent {
             if let p = ringPeek { ctx.ring.discard(toRead: p.toRead, available: p.available) }
-            zeroBuffers(UnsafeMutableAudioBufferListPointer(abl))
+            zeroBuffers(RawABL(abl))
             ctx.idleSkippedBlocks &+= 1
             return noErr
         }
@@ -505,7 +546,7 @@ func renderMixerGated(_ ctx: Ctx, _ mixer: AudioUnit,
 
 @inline(__always)
 private func renderedSilence(_ abl: UnsafeMutablePointer<AudioBufferList>, _ n: UInt32) -> Bool {
-    let bufs = UnsafeMutableAudioBufferListPointer(abl)
+    let bufs = RawABL(abl)
     var b = 0
     while b < bufs.count {
         guard let p = bufs[b].mData else { return false }
@@ -520,7 +561,8 @@ private func renderedSilence(_ abl: UnsafeMutablePointer<AudioBufferList>, _ n: 
 /// OS-fed head pose — settles before the audible block. Cold path: once per resume.
 @inline(never)
 func idleCatchUp(_ ctx: Ctx, _ mixer: AudioUnit, _ ts: UnsafePointer<AudioTimeStamp>) {
-    guard let scratch = ctx.scratchABL, ctx.idleCatchUpFrames > 0 else { return }
+    guard let list = ctx.scratchList, ctx.idleCatchUpFrames > 0 else { return }
+    let scratch = RawABL(list)
     let frames = ctx.idleCatchUpFrames
     var t = ts.pointee
     t.mSampleTime -= Float64(frames)
@@ -528,7 +570,7 @@ func idleCatchUp(_ ctx: Ctx, _ mixer: AudioUnit, _ ts: UnsafePointer<AudioTimeSt
     while b < scratch.count { scratch[b].mDataByteSize = frames * 4; b &+= 1 }
     ctx.feedSilence = true
     var f = AudioUnitRenderActionFlags()
-    _ = AudioUnitRender(mixer, &f, &t, 0, frames, scratch.unsafeMutablePointer)
+    _ = AudioUnitRender(mixer, &f, &t, 0, frames, list)
     ctx.feedSilence = false
 }
 
@@ -540,7 +582,7 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
 ) -> OSStatus in
     guard let ioData else { return noErr }
     let ctx = Unmanaged<Ctx>.fromOpaque(inRefCon).takeUnretainedValue()
-    let abl = UnsafeMutableAudioBufferListPointer(ioData)
+    let abl = RawABL(ioData)
     let n = inNumberFrames
     let nbuf = abl.count
     guard n <= ctx.spatialMaxFrames else {
@@ -556,7 +598,8 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
         }
         return noErr
     }
-    if ctx.unifiedOutputABL != nil, let cap = ctx.captureABL,
+    if ctx.unifiedOutputList != nil, let capList = ctx.captureList,
+       case let cap = RawABL(capList),
        let lRaw = cap[0].mData, let rRaw = cap[1].mData {
         // Unified tap path: tap input and device output share one clock and one IO cycle,
         // so the IOProc's de-interleaved capture planes feed the buses directly (no ring
@@ -681,7 +724,7 @@ nonisolated(unsafe) let playbackRenderCallback: AURenderCallback = { (
         ctx.totalPlayed &+= UInt64(n)
         return st
     }
-    let ablp = UnsafeMutableAudioBufferListPointer(ioData)
+    let ablp = RawABL(ioData)
     if ablp.count >= 2 {
         let dst0 = ablp[0].mData!.assumingMemoryBound(to: Float.self)
         let dst1 = ablp[1].mData!.assumingMemoryBound(to: Float.self)
