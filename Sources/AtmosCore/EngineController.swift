@@ -53,6 +53,11 @@ final class EngineController {
     /// the system default output). Cleared on a successful start / mode switch / retry.
     var permissionNeeded = false
 
+    /// True while a Personalized start has been blocked for more than a moment. The first start
+    /// for a code identity blocks inside AudioDeviceStart while macOS shows the audio-capture
+    /// consent prompt (the HAL gives up after ~30 s), so the UI says what it's waiting for.
+    var awaitingConsent = false
+
     /// The installed loopback exposes the full 12-channel 7.1.4 surface (enables Surround).
     var surroundDriverInstalled = false
 
@@ -181,7 +186,7 @@ final class EngineController {
     /// Add new published properties here too.
     func touchObservedState() {
         _ = (isOn, isStarting, isStopping, config, lastError, atmosPresent, outputName)
-        _ = (permissionNeeded, surroundDriverInstalled, channelPeaks, personalizedHRTFEngaged)
+        _ = (permissionNeeded, awaitingConsent, surroundDriverInstalled, channelPeaks, personalizedHRTFEngaged)
         _ = (ringFill, totalCaptured, totalPlayed, outputs, selectedOutputID, captureMode)
         _ = (meterL, meterR, peakHoldL, peakHoldR, headYaw, headPoseLive)
     }
@@ -511,6 +516,8 @@ final class EngineController {
                 restoreLoopbackDefault: restoreLoopbackDefault)
         }) { [weak self] result in
             guard let self else { return }
+            let blockedOnConsent = self.awaitingConsent
+            self.awaitingConsent = false
             switch result {
             case .success(let (aggregate, real, resolvedOutputType, devices)):
                 self.outputs = devices
@@ -529,13 +536,27 @@ final class EngineController {
                 self.isOn = false
                 self.resetLiveTelemetry()
                 self.syncIdleOutput(self.outputs)
+                // Consent is checked when audio starts, not when the tap is created: a denied
+                // prompt fails "unified start", an unanswered one times out after blocking.
+                let startFailed: Bool
+                if case SpatialEngineError.setupFailed("unified start") = error { startFailed = true } else { startFailed = false }
                 if let e = error as? ProcessTapError, case .createTapFailed = e {
+                    self.permissionNeeded = true
+                    self.lastError = nil
+                } else if startFailed || blockedOnConsent {
                     self.permissionNeeded = true
                     self.lastError = nil
                 } else {
                     self.permissionNeeded = false
                     self.lastError = "Personalized capture unavailable: \(error)."
                 }
+            }
+        }
+        let serial = operationSerial
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.isStarting, self.operationSerial == serial else { return }
+                self.awaitingConsent = true
             }
         }
     }
@@ -916,7 +937,7 @@ final class EngineController {
     var engineStatusText: String {
         switch engineStatus {
         case .off: return "Off"
-        case .starting: return "Starting…"
+        case .starting: return awaitingConsent ? "Waiting for audio-capture permission…" : "Starting…"
         case .on: return "On"
         case .stopping: return "Stopping…"
         }
