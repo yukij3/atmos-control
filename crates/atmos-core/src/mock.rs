@@ -328,7 +328,7 @@ impl MockEngine {
         }
         tel.total_captured = (t * 48_000.0) as u64;
         tel.total_played = tel.total_captured.saturating_sub(512);
-        tel.ring_fill = 512 + ((t * 31.0).sin() * 64.0) as i64 as u64;
+        tel.ring_fill = (512.0 + (t * 31.0).sin() * 64.0) as u64;
     }
 
     // ── Commands (same contracts as the C ABI's) ────────────────────────────────────────
