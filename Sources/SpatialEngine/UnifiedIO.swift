@@ -221,7 +221,8 @@ nonisolated(unsafe) let unifiedTapCallback: AudioDeviceIOProc = {
 
     if ctx.spatialize, let mixer = ctx.spatialMixer {
         var flags = AudioUnitRenderActionFlags()
-        let status = AudioUnitRender(mixer, &flags, outputTime, 0, n, rendered.unsafeMutablePointer)
+        let status = renderMixerGated(ctx, mixer, &flags, outputTime, n, rendered.unsafeMutablePointer,
+                                      inputSilent: peakL == 0 && peakR == 0, ringPeek: nil)
         ctx.totalPlayed &+= UInt64(n)
         guard status == noErr else { zeroBuffers(outs); return status }
     } else {

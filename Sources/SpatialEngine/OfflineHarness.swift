@@ -57,6 +57,9 @@ import Darwin
         }
     }
 
+    /// IO cycles whose mixer render the idle bypass skipped (telemetry).
+    public var idleSkippedBlocks: UInt64 { engine.ctx?.idleSkippedBlocks ?? 0 }
+
     deinit {
         engine.stop()
         free(inABL.unsafeMutablePointer)

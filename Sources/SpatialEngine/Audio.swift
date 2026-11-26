@@ -8,7 +8,7 @@
 import CoreAudio
 import AudioToolbox
 import Darwin          // memset, memcpy, free
-import Accelerate      // vDSP (peaks, downmix)
+import Accelerate      // vDSP (peaks, silence detection, downmix)
 import Synchronization // Atomic<UInt64> — release/acquire ordering on the SPSC indices
 
 // ---------------------------------------------------------------------------
@@ -256,6 +256,39 @@ final class RingBuffer {
         return UInt32(toRead)
     }
 
+    /// Consumer-side look-ahead for the idle bypass: are the next `frameCount` frames (or
+    /// fewer, if less is buffered) digital silence on every plane? Returns the frame count
+    /// it inspected plus the fill it saw, so `discard` consumes exactly what was checked.
+    @inline(__always)
+    func peekSilent(frameCount: UInt32) -> (silent: Bool, toRead: UInt64, available: UInt64) {
+        let ri = readIdx.load(ordering: .relaxed)
+        let wi = writeIdx.load(ordering: .acquiring)
+        let available = wi &- ri
+        let want = UInt64(frameCount)
+        let toRead = want < available ? want : available
+        if toRead == 0 { return (true, 0, available) }
+        let s = Int(ri & kRingMask)
+        let tail = Int(kRingFrames) - s
+        let count = Int(toRead)
+        let first = count < tail ? count : tail
+        var c = 0
+        while c < channels {
+            let plane = planes[c]
+            if !isDigitalSilence(plane + s, first) { return (false, toRead, available) }
+            if first < count && !isDigitalSilence(plane, count - first) { return (false, toRead, available) }
+            c &+= 1
+        }
+        return (true, toRead, available)
+    }
+
+    /// Consume frames inspected by `peekSilent` without copying them (idle bypass). Mirrors
+    /// `read`/`readAll` index + drift-controller semantics exactly.
+    @inline(__always)
+    func discard(toRead: UInt64, available: UInt64) {
+        if toRead == 0 { return }
+        let ri = readIdx.load(ordering: .relaxed)
+        readIdx.store(ri &+ advanceFor(available: available, toRead: toRead), ordering: .releasing)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +303,12 @@ func peakMagnitude(_ p: UnsafePointer<Float>, _ n: Int) -> Float {
     var m: Float = 0
     vDSP_maxmgv(p, 1, &m, vDSP_Length(n))
     return m
+}
+
+/// True only when every sample is ±0. NaN/Inf count as signal.
+@inline(__always)
+func isDigitalSilence(_ p: UnsafePointer<Float>, _ n: Int) -> Bool {
+    peakMagnitude(p, n) == 0
 }
 
 @inline(__always)
@@ -313,6 +352,24 @@ final class Ctx: @unchecked Sendable {
     var stageChannels: Int = 0
     var spatialMaxFrames: UInt32 = 0
     var lastStagedSampleTime: Float64 = -1        // stage the ring once per render cycle
+
+    // --- Idle bypass (RT-thread owned except where noted) ---
+    // When the mixer has seen exact-zero input AND produced exact-zero output for
+    // `idleHoldFrames`, its render is skipped (output = exact zeros, which is what it
+    // would have produced). Any live param/property change bumps `paramEpoch` (control
+    // thread) and re-arms rendering so ramps run exactly as before. On the first non-silent
+    // block a discarded zero-input `idleCatchUpFrames` render lets internal state that may
+    // have moved while skipped (OS head pose) converge before the audible block.
+    var idleBypassEnabled = true                  // set on the setup thread before audio runs
+    var idleHoldFrames: UInt64 = 12_000
+    var idleCatchUpFrames: UInt32 = 0
+    var idleQuietFrames: UInt64 = 0
+    var idleBypassing = false
+    var feedSilence = false                       // input callback feeds zeros (catch-up render)
+    let paramEpoch = Atomic<UInt32>(0)            // bumped by the control thread
+    var seenParamEpoch: UInt32 = 0
+    var scratchABL: UnsafeMutableAudioBufferListPointer? = nil   // catch-up render target
+    var idleSkippedBlocks: UInt64 = 0             // telemetry (bench)
 
     init(channels: Int) {
         self.channels = channels
@@ -407,6 +464,73 @@ func processCapturedBlock(_ ctx: Ctx, abl: UnsafeMutableAudioBufferListPointer, 
     }
 }
 
+/// Render the spatial mixer, or skip it while idle (see Ctx idle-bypass fields).
+/// `inputSilent` = the frames the mixer would pull this cycle are all exact zeros.
+/// `ringPeek` (loopback only) = what `peekSilent` inspected, consumed when skipping so
+/// the ring advances exactly as the mixer's input callback would have advanced it.
+/// Returns the render status; when skipping, writes exact zeros into `abl`.
+@inline(__always)
+func renderMixerGated(_ ctx: Ctx, _ mixer: AudioUnit,
+                      _ flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                      _ ts: UnsafePointer<AudioTimeStamp>, _ n: UInt32,
+                      _ abl: UnsafeMutablePointer<AudioBufferList>, inputSilent: Bool,
+                      ringPeek: (toRead: UInt64, available: UInt64)?) -> OSStatus {
+    let epoch = ctx.paramEpoch.load(ordering: .acquiring)
+    if epoch != ctx.seenParamEpoch {
+        // A live param change must ramp inside the mixer exactly as before: render again
+        // (zeros in → zeros out) until the hold re-qualifies.
+        ctx.seenParamEpoch = epoch
+        ctx.idleQuietFrames = 0
+        ctx.idleBypassing = false
+    }
+    if ctx.idleBypassing {
+        if inputSilent {
+            if let p = ringPeek { ctx.ring.discard(toRead: p.toRead, available: p.available) }
+            zeroBuffers(UnsafeMutableAudioBufferListPointer(abl))
+            ctx.idleSkippedBlocks &+= 1
+            return noErr
+        }
+        ctx.idleBypassing = false
+        idleCatchUp(ctx, mixer, ts)
+    }
+    let st = AudioUnitRender(mixer, flags, ts, 0, n, abl)
+    if inputSilent && st == noErr && ctx.idleBypassEnabled && renderedSilence(abl, n) {
+        ctx.idleQuietFrames &+= UInt64(n)
+        if ctx.idleQuietFrames >= ctx.idleHoldFrames { ctx.idleBypassing = true }
+    } else {
+        ctx.idleQuietFrames = 0
+    }
+    return st
+}
+
+@inline(__always)
+private func renderedSilence(_ abl: UnsafeMutablePointer<AudioBufferList>, _ n: UInt32) -> Bool {
+    let bufs = UnsafeMutableAudioBufferListPointer(abl)
+    var b = 0
+    while b < bufs.count {
+        guard let p = bufs[b].mData else { return false }
+        if !isDigitalSilence(p.assumingMemoryBound(to: Float.self), Int(bufs[b].mDataByteSize) / 4) { return false }
+        b &+= 1
+    }
+    return true
+}
+
+/// Resume from idle: one discarded render of silence (input callback feeds zeros, the
+/// ring/tap data is untouched) so state that may have changed while skipped — chiefly the
+/// OS-fed head pose — settles before the audible block. Cold path: once per resume.
+@inline(never)
+func idleCatchUp(_ ctx: Ctx, _ mixer: AudioUnit, _ ts: UnsafePointer<AudioTimeStamp>) {
+    guard let scratch = ctx.scratchABL, ctx.idleCatchUpFrames > 0 else { return }
+    let frames = ctx.idleCatchUpFrames
+    var t = ts.pointee
+    t.mSampleTime -= Float64(frames)
+    var b = 0
+    while b < scratch.count { scratch[b].mDataByteSize = frames * 4; b &+= 1 }
+    ctx.feedSilence = true
+    var f = AudioUnitRenderActionFlags()
+    _ = AudioUnitRender(mixer, &f, &t, 0, frames, scratch.unsafeMutablePointer)
+    ctx.feedSilence = false
+}
 
 // Sole ring consumer in spatialize mode (runs inside AudioUnitRender on the
 // playback HAL thread). dualPoint = stereo split across two mono buses;
@@ -421,6 +545,15 @@ nonisolated(unsafe) let spatialInputCallback: AURenderCallback = { (
     let nbuf = abl.count
     guard n <= ctx.spatialMaxFrames else {
         var b = 0; while b < nbuf { if let p = abl[b].mData { memset(p, 0, Int(abl[b].mDataByteSize)) }; b &+= 1 }
+        return noErr
+    }
+    if ctx.feedSilence {
+        // Idle catch-up render: zeros, leave the ring / tap data untouched.
+        var b = 0
+        while b < nbuf {
+            if let p = abl[b].mData { memset(p, 0, Int(n) * 4 * Int(abl[b].mNumberChannels)); abl[b].mDataByteSize = n * 4 * abl[b].mNumberChannels }
+            b &+= 1
+        }
         return noErr
     }
     if ctx.unifiedOutputABL != nil, let cap = ctx.captureABL,
@@ -540,7 +673,11 @@ nonisolated(unsafe) let playbackRenderCallback: AURenderCallback = { (
     let ctx = Unmanaged<Ctx>.fromOpaque(inRefCon).takeUnretainedValue()
     let n = inNumberFrames
     if ctx.spatialize, let mixer = ctx.spatialMixer {
-        let st = AudioUnitRender(mixer, ioActionFlags, inTimeStamp, 0, n, ioData)
+        // The mixer will pull the next n ring frames (dual/surround stage once per cycle;
+        // bed/mono read n) — look at exactly those to decide whether it can idle.
+        let peek = ctx.ring.peekSilent(frameCount: n)
+        let st = renderMixerGated(ctx, mixer, ioActionFlags, inTimeStamp, n, ioData,
+                                  inputSilent: peek.silent, ringPeek: (peek.toRead, peek.available))
         ctx.totalPlayed &+= UInt64(n)
         return st
     }

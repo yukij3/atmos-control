@@ -3,6 +3,7 @@
 @_spi(Bench) import SpatialEngine
 
 func applyBenchSwitches(_ engine: SpatialEngine) {
+    engine.idleBypassEnabled = optIdleBypass
 }
 
-func skippedBlocks(_ r: OfflineRenderer) -> UInt64 { 0 }
+func skippedBlocks(_ r: OfflineRenderer) -> UInt64 { r.idleSkippedBlocks }

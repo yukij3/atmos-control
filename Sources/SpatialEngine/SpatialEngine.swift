@@ -177,6 +177,10 @@ public final class SpatialEngine: @unchecked Sendable {
     /// sample rate or stream channel layout while running. The engine never rebuilds itself
     /// on a private queue; the owner serializes any rebuild or teardown on its own queue.
     public var onFormatChange: (() -> Void)? = nil
+    /// Skip AUSpatialMixer renders while the input is digital silence and the mixer output
+    /// has decayed to exact zero (bit-identical output; see Ctx). Benchmark/diagnostic switch,
+    /// read at start(). Not public API.
+    @_spi(Bench) public var idleBypassEnabled = true
 
     var ctx: Ctx?                              // internal: shared with the offline bench harness
     private var outputDeviceID: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
@@ -480,9 +484,16 @@ public final class SpatialEngine: @unchecked Sendable {
             ctx.stageChannels = captureChannels
         }
         ctx.spatialMaxFrames = spatialMax
+        // Idle bypass: skip the mixer after 250 ms of exact-zero in AND out (longer than the
+        // HRTF FIR; the reverb tail must reach exact zero first). Resume primes ~85-100 ms.
+        ctx.idleBypassEnabled = idleBypassEnabled
+        ctx.idleHoldFrames = UInt64(outputRate * 0.25)
+        ctx.idleCatchUpFrames = min(spatialMax, UInt32(outputRate * 0.1))
+        ctx.scratchABL = makeCaptureABL(maxFrames: spatialMax, channels: 2)
         ctx.spatialMixer = mixer
         applySourceParams(mixer: mixer, mode: mode)
         applyReverbParams(mixer: mixer, mode: mode)
+        ctx.seenParamEpoch = ctx.paramEpoch.load(ordering: .relaxed)
         ctx.spatialize = true   // publish last
         return true
     }
@@ -542,6 +553,11 @@ public final class SpatialEngine: @unchecked Sendable {
             for ch in 0..<abl.count { abl[ch].mData?.deallocate() }
             free(abl.unsafeMutablePointer)
             ctx.unifiedOutputABL = nil
+        }
+        if let abl = ctx.scratchABL {
+            for ch in 0..<abl.count { abl[ch].mData?.deallocate() }
+            free(abl.unsafeMutablePointer)
+            ctx.scratchABL = nil
         }
         self.ctx = nil
     }
@@ -664,11 +680,19 @@ public final class SpatialEngine: @unchecked Sendable {
         if let mixer = ctx?.spatialMixer { applyReverbParams(mixer: mixer, mode: activeSourceMode) }
     }
 
+    /// Tell the RT thread a live mixer param changed so an idle-bypassed mixer renders
+    /// again and the change ramps exactly as it would have (see Ctx idle-bypass fields).
+    /// Bump AFTER the AudioUnitSetParameter calls.
+    func noteMixerParamsChanged() {
+        ctx?.paramEpoch.wrappingAdd(1, ordering: .releasing)
+    }
+
     /// The internal reverb wet path only renders under HRTF/HRTF-HQ; under
     /// Use Output Type it is inert and ReverbBlend would only attenuate the dry path.
     var reverbActive: Bool { config.reverbEnabled && config.algorithm != .useOutputType }
 
     private func applySourceParams(mixer: AudioUnit, mode: SourceRenderMode) {
+        defer { noteMixerParamsChanged() }
         // Below ~0.2 m the UseOutputType renderer collapses the stereo image back into
         // the head; clamp at the engine boundary so no caller can drive it there.
         let dist = min(max(config.distance, 0.35), config.distanceMax)
@@ -707,6 +731,7 @@ public final class SpatialEngine: @unchecked Sendable {
 
     private func applyReverbParams(mixer: AudioUnit, mode: SourceRenderMode) {
         guard reverbActive else { return }
+        defer { noteMixerParamsChanged() }
         let buses: [AudioUnitElement]
         if mode.isDualPoint {
             buses = [0, 1]
