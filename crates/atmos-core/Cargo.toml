@@ -9,3 +9,8 @@ build = "build.rs"
 
 [dependencies]
 atmos-core-sys = { workspace = true }
+
+# Runs on the process's main thread (the C ABI's contract) and drives the main run loop.
+[[test]]
+name = "real_core"
+harness = false
