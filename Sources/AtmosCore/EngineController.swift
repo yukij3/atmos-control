@@ -1,23 +1,21 @@
-// EngineController — @MainActor view-model bridging SwiftUI ↔ SpatialEngine.
-// Owns the power on/off orchestration (default-output routing) and a poll timer
-// that publishes live engine telemetry (peaks, 3116, ring fill) to the UI.
+// EngineController — the @MainActor state model over SpatialEngine. Owns the power on/off
+// orchestration (default-output routing), device hot-swap and format-change recovery, and a
+// poll timer that publishes live engine telemetry (peaks, 3116, ring fill).
 //
-// Uses the Observation framework (@Observable) rather than ObservableObject so SwiftUI
-// tracks per-property reads: a meter-rate write no longer invalidates the whole tree,
-// only the views that actually read the changed property.
+// UI-agnostic: the Rune UI reads it through the C ABI in AtmosCoreABI.swift (one snapshot
+// struct, see Sources/AtmosCoreABI/include/atmos_core.h). @Observable is kept only as a
+// change signal: CoreHost tracks every property the snapshot reads and notifies the UI once
+// per main-queue turn when any of them changes.
 
-import SwiftUI
 import AppKit
 import CoreAudio
 import Observation
 import SpatialEngine
 
 /// How the engine captures system audio.
-enum CaptureMode: String, CaseIterable, Identifiable {
+enum CaptureMode {
     case processTap      // muting process tap; AirPods stay default → personalized HRTF + no black-hole
     case loopbackDriver  // hijack the default to the atmos-control loopback; generic HRTF only
-    var id: String { rawValue }
-    var label: String { self == .processTap ? "Personalized (tap)" : "Loopback driver" }
 }
 
 @MainActor
@@ -25,7 +23,16 @@ enum CaptureMode: String, CaseIterable, Identifiable {
 final class EngineController {
     var isOn = false
     var isStarting = false
+    /// A power-off teardown is in flight (isStarting is also true then). Lets the status
+    /// strip say "Stopping…" instead of claiming the engine is starting.
+    var isStopping = false
     @ObservationIgnored private var isTerminating = false
+    /// A config edit arrived while a lifecycle operation was in flight; re-applied once it
+    /// lands so the engine never drifts from what the controls show.
+    @ObservationIgnored private var pendingConfigApply = false
+    /// The device `config.outputType` was last resolved for. The output type follows the
+    /// output device (headphones vs speakers) unless the user picks one for that device.
+    @ObservationIgnored private var outputTypeDeviceID: AudioDeviceID?
     @ObservationIgnored private var stopRequested = false
     @ObservationIgnored private var pendingDeviceChange = false
     @ObservationIgnored private var pendingFormatChange = false
@@ -80,21 +87,18 @@ final class EngineController {
     @ObservationIgnored private var activeSinkID: AudioDeviceID?   // real device the graph renders to
     @ObservationIgnored private var activeCaptureID: AudioDeviceID?  // tap aggregate (tap mode) or nil
     @ObservationIgnored private var handlingChange = false
+    @ObservationIgnored fileprivate var musicSettingCache: (value: Int?, at: Date)?
 
-    // Surface visibility. The MenuBarExtra(.window) popover's visibility is taken from its
-    // NSWindow (bindPanelWindow) because SwiftUI .onDisappear is not reliably delivered when
-    // that popover dismisses; the Settings Window's onAppear/onDisappear ARE reliable.
+    // Surface visibility, reported by the UI (atmos_core_set_visible): the panel and the
+    // settings window are open independently. Gates meter polling and head motion.
     @ObservationIgnored private var panelOnScreen = false
     @ObservationIgnored private var settingsOnScreen = false
-    @ObservationIgnored private weak var panelWindow: NSWindow?   // weak: don't pin the hidden popover window
-    @ObservationIgnored private var panelOcclusionObserver: NSObjectProtocol?
 
     /// The engine can run for the CURRENT capture choice. Personalized (tap) needs no driver;
     /// the virtual-device options need the HAL device (Surround needs the 12-channel variant).
-    /// The panel never collapses on this — a false value only disables the power toggle and
-    /// shows an inline notice (F11).
+    /// A capability only: while a lifecycle operation is in flight (`isStarting`) the UI also
+    /// disables the power control, but this stays true so the "can't run" notice never flashes.
     var canRun: Bool {
-        if isStarting { return false }
         switch captureChoice {
         case .personalized:  return true
         case .virtualStereo: return atmosPresent
@@ -114,16 +118,13 @@ final class EngineController {
         guard !isStarting, choice != captureChoice else { return }
         cancelFormatRetry()
         permissionNeeded = false
+        lastError = nil
         let wasOn = isOn
         let prevMode = captureMode
         switch choice {
         case .personalized:
             captureMode = .processTap
             if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
-            if !wasOn {
-                let cur = SpatialEngine.currentDefaultOutput()
-                if cur.id != SpatialEngine.atmosControlDeviceID() { outputName = cur.name }
-            }
         case .virtualStereo:
             captureMode = .loopbackDriver
             if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
@@ -131,7 +132,7 @@ final class EngineController {
             captureMode = .loopbackDriver
             config.sourceMode = .surround714
         }
-        guard wasOn else { return }
+        guard wasOn else { syncIdleOutput(outputs); return }
         if prevMode == captureMode && captureMode == .loopbackDriver {
             applyConfig()
             return
@@ -143,19 +144,12 @@ final class EngineController {
         }
     }
 
-    /// The live controller. Production creates exactly one (the App's @State model); the
-    /// app delegate uses this to run cleanup on quit / logout / shutdown without building a
-    /// second engine. (Preview mode's throwaway controller may overwrite it — harmless,
-    /// since preview never powers on.)
-    static weak var shared: EngineController?
-
     init() {
-        EngineController.shared = self
         atmosPresent = engine.atmosControlPresent()
         surroundDriverInstalled = engine.surroundDriverInstalled()
-        let cur = SpatialEngine.currentDefaultOutput()
-        outputName = cur.name
         outputs = engine.outputDevices()
+        outputName = SpatialEngine.currentDefaultOutput().name
+        syncIdleOutput(outputs)
 
         motion.onYaw = { [weak self] y in
             guard let self else { return }
@@ -171,6 +165,16 @@ final class EngineController {
         engine.onFormatChange = { [weak self] in
             MainActor.assumeIsolated { self?.handleFormatChange() }
         }
+    }
+
+    /// Reads every observed property the C ABI snapshot exposes, inside
+    /// withObservationTracking (CoreHost), so a change to any of them notifies the UI.
+    /// Add new published properties here too.
+    func touchObservedState() {
+        _ = (isOn, isStarting, isStopping, config, lastError, atmosPresent, outputName)
+        _ = (permissionNeeded, surroundDriverInstalled, channelPeaks, personalizedHRTFEngaged)
+        _ = (ringFill, totalCaptured, totalPlayed, outputs, selectedOutputID, captureMode)
+        _ = (meterL, meterR, peakHoldL, peakHoldR, headYaw, headPoseLive)
     }
 
     // MARK: Output devices
@@ -191,8 +195,30 @@ final class EngineController {
         return dev.name.localizedCaseInsensitiveContains("headphone") ? .headphones : .builtInSpeakers
     }
 
-    private func outputType(for dev: AudioOutputDevice) -> OutputType {
-        Self.defaultOutputType(for: dev)
+    /// Adopt the device-appropriate output type when the output device changes; keep the
+    /// user's pick for as long as audio stays on the same device.
+    private func syncOutputType(to dev: AudioOutputDevice) {
+        guard dev.id != outputTypeDeviceID else { return }
+        outputTypeDeviceID = dev.id
+        config.outputType = Self.defaultOutputType(for: dev)
+    }
+
+    /// While the engine is off, show (and pre-resolve the output type for) the device the
+    /// next start will render to: the picked sink in the loopback modes, else the macOS
+    /// default output (never the atmos-control loopback itself).
+    private func syncIdleOutput(_ devices: [AudioOutputDevice]) {
+        guard !isOn else { return }
+        let dev: AudioOutputDevice?
+        if captureMode == .loopbackDriver, let sel = selectedOutputID,
+           let picked = devices.first(where: { $0.id == sel }) {
+            dev = picked
+        } else {
+            let cur = SpatialEngine.currentDefaultOutput()
+            dev = devices.first(where: { $0.id == cur.id })
+        }
+        guard let dev else { return }
+        outputName = dev.name
+        syncOutputType(to: dev)
     }
 
     /// Pick which real sink to route through (loopback modes only; nil = follow the system default).
@@ -200,7 +226,7 @@ final class EngineController {
     func selectOutput(_ dev: AudioOutputDevice?) {
         guard captureMode == .loopbackDriver else { return }
         selectedOutputID = dev?.id
-        if let d = dev { outputName = d.name; config.outputType = outputType(for: d) }
+        if let d = dev { outputName = d.name; syncOutputType(to: d) } else { syncIdleOutput(outputs) }
         guard isOn, !isStarting else { return }
         let engine = self.engine, snapshot = config, targetID = dev?.id
         performAudioChange({
@@ -239,11 +265,7 @@ final class EngineController {
         outputs = devices
         if let sel = selectedOutputID, !devices.contains(where: { $0.id == sel }) { selectedOutputID = nil }
 
-        guard isOn else {
-            let cur = SpatialEngine.currentDefaultOutput()
-            if cur.id != SpatialEngine.atmosControlDeviceID() { outputName = cur.name }
-            return
-        }
+        guard isOn else { syncIdleOutput(devices); return }
         if captureMode == .processTap {
             let cur = SpatialEngine.currentDefaultOutput()
             guard let next = devices.first(where: { $0.id == cur.id }) else {
@@ -253,6 +275,7 @@ final class EngineController {
             }
             if next.id != activeSinkID {
                 cancelFormatRetry()
+                headPoseLive = false   // the new device may not report head motion
                 startTapMode()
             }
             return
@@ -271,7 +294,8 @@ final class EngineController {
             powerOff()
             return
         }
-        config.outputType = outputType(for: fallback)
+        syncOutputType(to: fallback)
+        headPoseLive = false
         let engine = self.engine, snapshot = config
         performAudioChange({
             engine.stop()
@@ -282,9 +306,10 @@ final class EngineController {
             guard let self else { return }
             switch result {
             case .success(let dev):
+                // The Output status shows the new device; this is not an error.
                 self.activeSinkID = dev.id
                 self.outputName = dev.name
-                self.lastError = "Output changed — now routing to \(dev.name)."
+                self.lastError = nil
                 self.updateActivity()
             case .failure(let error):
                 self.lastError = "Output device lost — \(error)"
@@ -314,15 +339,19 @@ final class EngineController {
         if isStarting { pendingFormatChange = true; return }
         if captureMode == .processTap {
             if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
-            let engine = self.engine, tap = self.tap, baseConfig = config
+            let engine = self.engine, tap = self.tap, baseConfig = config, typeDevice = outputTypeDeviceID
             performAudioChange({
-                try Self.startTapSession(engine: engine, tap: tap, baseConfig: baseConfig)
+                try Self.startTapSession(engine: engine, tap: tap, baseConfig: baseConfig,
+                                         outputTypeDeviceID: typeDevice)
             }) { [weak self] result in
                 guard let self else { return }
                 switch result {
                 case .success(let (aggregate, dev, resolvedOutputType, devices)):
                     self.outputs = devices
-                    self.config.outputType = resolvedOutputType
+                    // Same device: keep config.outputType as is (a pick made while the rebuild
+                    // ran is re-applied by drainPendingEvents via pendingConfigApply).
+                    if dev.id != typeDevice { self.config.outputType = resolvedOutputType }
+                    self.outputTypeDeviceID = dev.id
                     self.activeCaptureID = aggregate
                     self.activeSinkID = dev.id
                     self.outputName = dev.name
@@ -370,45 +399,16 @@ final class EngineController {
 
     /// Poll meters + run head-motion only while a window is actually on screen — the
     /// engine keeps spatializing when closed, but nobody's looking at the live readouts.
-    /// (Counted because the panel and settings window can be open independently.)
-    /// Panel (MenuBarExtra popover) visibility — the authoritative signal is the popover
-    /// NSWindow (see bindPanelWindow). onAppear/onDisappear are kept only as a fallback.
-    func panelAppeared()    { panelOnScreen = true;  updateActivity() }
-    func panelDisappeared() { panelOnScreen = false; updateActivity() }
-    /// Settings is a normal Window scene whose onAppear/onDisappear are reliable.
-    func settingsAppeared()    { settingsOnScreen = true;  updateActivity() }
-    func settingsDisappeared() { settingsOnScreen = false; updateActivity() }
-
-    private var anySurfaceVisible: Bool { panelOnScreen || settingsOnScreen }
-
-    /// Bind the panel popover's hosting NSWindow (handed over by WindowAccessor when the
-    /// view moves in/out of a window). Drives visibility from the window leaving the
-    /// hierarchy AND from occlusion — so polling/motion stop the instant the popover is
-    /// dismissed, even though SwiftUI does not reliably deliver .onDisappear for it.
-    func bindPanelWindow(_ window: NSWindow?) {
-        guard window !== panelWindow else { return }
-        if let obs = panelOcclusionObserver {
-            NotificationCenter.default.removeObserver(obs)
-            panelOcclusionObserver = nil
-        }
-        panelWindow = window
-        guard let window else { panelOnScreen = false; updateActivity(); return }
-        // OR so a transient not-yet-on-screen occlusion read at bind time can't clobber a
-        // `true` just set by onAppear; the observer below corrects it within a frame anyway.
-        panelOnScreen = panelOnScreen || window.occlusionState.contains(.visible)
-        panelOcclusionObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                // Registered for this window only; read it back on the main actor (avoids
-                // sending the non-Sendable Notification across the isolation boundary).
-                let visible = self.panelWindow?.occlusionState.contains(.visible) ?? false
-                if self.panelOnScreen != visible { self.panelOnScreen = visible; self.updateActivity() }
-            }
-        }
+    /// The UI reports both surfaces (they can be open independently), including occlusion:
+    /// a covered or minimised window counts as not visible.
+    func setSurfaces(panel: Bool, settings: Bool) {
+        guard panel != panelOnScreen || settings != settingsOnScreen else { return }
+        panelOnScreen = panel
+        settingsOnScreen = settings
         updateActivity()
     }
+
+    private var anySurfaceVisible: Bool { panelOnScreen || settingsOnScreen }
 
     private func updateActivity() {
         if isOn && anySurfaceVisible { startPolling() } else { stopPolling() }
@@ -424,8 +424,12 @@ final class EngineController {
             motion.start()
         } else {
             motion.stop()
-            headPoseLive = false
-            headYaw = 0
+            // Only forget the pose when tracking really stopped — not when the panel merely
+            // closed — so reopening it doesn't flash "Unavailable" before the first sample.
+            if !isOn || !config.headTracking {
+                headPoseLive = false
+                headYaw = 0
+            }
         }
     }
 
@@ -438,13 +442,15 @@ final class EngineController {
         atmosPresent = engine.atmosControlPresent()
         surroundDriverInstalled = engine.surroundDriverInstalled()
         permissionNeeded = false
+        lastError = nil
         if captureMode == .processTap { startTapMode(); return }
         startLoopbackMode()   // explicit virtual-device (loopback) mode — never an auto-fallback
     }
 
-    /// Deep-link into System Settings ▸ Privacy so the user can grant audio-capture consent.
+    /// Deep-link into System Settings ▸ Privacy & Security ▸ the audio-capture list, where the
+    /// process-tap consent lives (not Microphone — the tap never opens an input device).
     func openPrivacySettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
             NSWorkspace.shared.open(url)
         }
     }
@@ -452,19 +458,12 @@ final class EngineController {
     /// Explicit, user-initiated retry after a permission failure (does NOT change routing).
     func retryCapture() { permissionNeeded = false; powerOn() }
 
-    /// Explicit, user-initiated switch to the virtual-device path (this one DOES change the
-    /// default output — so it only happens on a deliberate tap, never as a silent fallback).
-    func switchToVirtualDevice() {
-        permissionNeeded = false
-        setCaptureChoice(.virtualStereo)
-        if !isOn { powerOn() }
-    }
-
     /// Shared audioQueue helper for starting or rebuilding a device-scoped process-tap session.
     private nonisolated static func startTapSession(
         engine: SpatialEngine,
         tap: ProcessTap,
         baseConfig: SpatialConfig,
+        outputTypeDeviceID: AudioDeviceID?,
         restoreLoopbackDefault: AudioDeviceID? = nil
     ) throws -> (AudioDeviceID, AudioOutputDevice, OutputType, [AudioOutputDevice]) {
         engine.stop()
@@ -478,7 +477,8 @@ final class EngineController {
             throw SpatialEngineError.noOutputDevice
         }
         var snapshot = baseConfig
-        snapshot.outputType = defaultOutputType(for: real)
+        // Keep the user's output type if audio is still on the device it was chosen for.
+        if real.id != outputTypeDeviceID { snapshot.outputType = defaultOutputType(for: real) }
         do {
             let aggregate = try tap.start(muted: true, outputDeviceID: real.id)
             engine.config = snapshot
@@ -495,17 +495,18 @@ final class EngineController {
     /// output so apps play into the tapped sink and property 3116 stays engaged.
     private func startTapMode(restoreLoopbackDefault: AudioDeviceID? = nil) {
         if config.sourceMode.isSurroundMode { config.sourceMode = .dualPointStereo }
-        let engine = self.engine, tap = self.tap, baseConfig = config
+        let engine = self.engine, tap = self.tap, baseConfig = config, typeDevice = outputTypeDeviceID
         performAudioChange({
             try Self.startTapSession(
-                engine: engine, tap: tap, baseConfig: baseConfig,
+                engine: engine, tap: tap, baseConfig: baseConfig, outputTypeDeviceID: typeDevice,
                 restoreLoopbackDefault: restoreLoopbackDefault)
         }) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let (aggregate, real, resolvedOutputType, devices)):
                 self.outputs = devices
-                self.config.outputType = resolvedOutputType
+                if real.id != typeDevice { self.config.outputType = resolvedOutputType }
+                self.outputTypeDeviceID = real.id
                 self.outputName = real.name
                 self.activeCaptureID = aggregate
                 self.activeSinkID = real.id
@@ -518,6 +519,7 @@ final class EngineController {
                 self.savedDefault = nil
                 self.isOn = false
                 self.resetLiveTelemetry()
+                self.syncIdleOutput(self.outputs)
                 if let e = error as? ProcessTapError, case .createTapFailed = e {
                     self.permissionNeeded = true
                     self.lastError = nil
@@ -565,6 +567,10 @@ final class EngineController {
             pendingFormatChange = false
             handleFormatChange()
         }
+        if pendingConfigApply && !isStarting {
+            pendingConfigApply = false
+            applyConfig()
+        }
     }
 
     /// Loopback capture: hijack the system default to the atmos-control HAL device.
@@ -590,7 +596,7 @@ final class EngineController {
         } else {
             real = devices.first(where: { $0.id == current.id })
         }
-        if let r = real { config.outputType = outputType(for: r); outputName = r.name }
+        if let r = real { syncOutputType(to: r); outputName = r.name }
         let engine = self.engine, tap = self.tap, snapshot = config
         let sinkID = real?.id ?? (current.id != atmos ? current.id : nil)
 
@@ -639,9 +645,11 @@ final class EngineController {
     func powerOff() {
         cancelFormatRetry()
         if isStarting {
+            // Queued behind the in-flight operation (drainPendingEvents runs it); say so now.
             stopRequested = true
             pendingDeviceChange = false
             pendingFormatChange = false
+            isStopping = true
             return
         }
         let restoreDefault = savedDefault
@@ -649,7 +657,8 @@ final class EngineController {
         isOn = false
         savedDefault = nil
         resetLiveTelemetry()
-        guard needsTeardown else { return }
+        guard needsTeardown else { isStopping = false; syncIdleOutput(outputs); return }
+        isStopping = true
         let engine = self.engine, tap = self.tap
         performAudioChange({
             engine.stop()
@@ -657,10 +666,14 @@ final class EngineController {
             if let restoreDefault {
                 Self.restoreSafeDefault(savedDefault: restoreDefault, engine: engine)
             }
-        }) { _ in }
+        }) { [weak self] _ in
+            guard let self else { return }
+            self.isStopping = false
+            self.syncIdleOutput(self.engine.outputDevices())
+        }
     }
 
-    /// Synchronous teardown for applicationWillTerminate so the process never exits before
+    /// Synchronous teardown for app termination so the process never exits before
     /// destroying the tap/aggregate or restoring the loopback default. Pumps the main run loop
     /// briefly if an audioQueue transition is in flight so HAL registration cannot deadlock.
     func shutdownForTermination() {
@@ -687,14 +700,9 @@ final class EngineController {
             Self.restoreSafeDefault(savedDefault: restoreDefault, engine: engine)
         }
         isOn = false
+        isStopping = false
         savedDefault = nil
         resetLiveTelemetry()
-    }
-
-    /// Switch the capture path (restarts atomically if running).
-    func setCaptureMode(_ m: CaptureMode) {
-        guard !isStarting, captureMode != m else { return }
-        setCaptureChoice(m == .processTap ? .personalized : (config.sourceMode.isSurroundMode ? .surround : .virtualStereo))
     }
 
     /// Restore the system default to a present, real (non-virtual) device. Prefers the
@@ -719,7 +727,10 @@ final class EngineController {
         if captureMode == .processTap && config.sourceMode.isSurroundMode {
             config.sourceMode = .dualPointStereo
         }
-        guard !isStarting, isOn else { return }
+        // The engine clamps the source to Max distance; mirror it so the readout never lies.
+        config.distance = min(max(config.distance, Self.minDistance), config.distanceMax)
+        if isStarting { pendingConfigApply = true; return }
+        guard isOn else { return }
         let engine = self.engine, snapshot = config
         performAudioChange({ try engine.reconfigure(snapshot) }) { [weak self] result in
             guard let self else { return }
@@ -735,41 +746,70 @@ final class EngineController {
                    gain: Float? = nil, width: Float? = nil) {
         if let a = azimuth { config.azimuth = a }
         if let e = elevation { config.elevation = e }
-        if let d = distance { config.distance = d }
+        // Mirror the engine's clamp (SpatialEngine.updateSource) so the readout never lies.
+        let dist = distance.map { min(max($0, Self.minDistance), config.distanceMax) }
+        if let d = dist { config.distance = d }
         if let g = gain { config.gain = g }
         if let w = width { config.stereoWidth = w }
-        guard !isStarting, isOn, formatRetryWorkItem == nil else { return }
-        engine.updateSource(azimuth: azimuth, elevation: elevation, distance: distance, gain: gain, width: width)
+        if isStarting { pendingConfigApply = true; return }
+        guard isOn, formatRetryWorkItem == nil else { return }
+        engine.updateSource(azimuth: azimuth, elevation: elevation, distance: dist, gain: gain, width: width)
     }
 
     /// Live reverb wet/dry blend (no rebuild; no-op in the engine unless the reverb path is
     /// active, i.e. HRTF / HRTF-HQ).
     func setReverbBlend(_ v: Float) {
         config.reverbBlend = v
-        guard !isStarting, isOn, formatRetryWorkItem == nil else { return }
+        if isStarting { pendingConfigApply = true; return }
+        guard isOn, formatRetryWorkItem == nil else { return }
         engine.updateReverb(blend: v)
     }
 
-    /// Reset the soundstage to the front-and-centre default (F13 / amendment B).
+    /// The engine's defaults: the single source of truth for both Reset actions and for the
+    /// defaults the UI shows (atmos_core_default_config).
+    static let defaults = SpatialConfig()
+    /// SpatialEngine clamps the source distance to at least this (applySourceParams).
+    static let minDistance: Float = 0.35
+
+    /// Reset the soundstage (position, gain, stereo width) to front-and-centre.
     func resetSoundstage() {
-        setSource(azimuth: 0, elevation: 0, distance: Float(Param.distance.def),
-                  gain: 0, width: Float(Param.width.def))
+        let d = Self.defaults
+        setSource(azimuth: d.azimuth, elevation: d.elevation, distance: d.distance,
+                  gain: d.gain, width: d.stereoWidth)
     }
 
-    /// Reset the advanced rendering block to its defaults (amendment B).
+    /// Nothing to reset — lets both Reset buttons show a truthful disabled state.
+    var soundstageIsDefault: Bool {
+        let c = config, d = Self.defaults
+        return c.azimuth == d.azimuth && c.elevation == d.elevation && c.distance == d.distance
+            && c.gain == d.gain && c.stereoWidth == d.stereoWidth
+    }
+
+    /// Reset the rendering block (algorithm, reverb, distance model) to its defaults.
     func resetRendering() {
-        config.interauralDelay = true
-        config.distanceAttenuation = false
-        config.attenuationCurve = .inverse
-        config.distanceRef = Float(Param.distanceRef.def)
-        config.distanceMax = Float(Param.distanceMax.def)
-        config.distanceMaxAtten = Float(Param.distanceAtten.def)
-        config.reverbEnabled = true
-        config.reverbRoomType = .medium
-        config.reverbBlend = Float(Param.reverbBlend.def)
-        config.globalReverbGain = Float(Param.reverbGain.def)
-        config.algorithm = .useOutputType
+        let d = Self.defaults
+        config.algorithm = d.algorithm
+        config.interauralDelay = d.interauralDelay
+        config.distanceAttenuation = d.distanceAttenuation
+        config.attenuationCurve = d.attenuationCurve
+        config.distanceRef = d.distanceRef
+        config.distanceMax = d.distanceMax
+        config.distanceMaxAtten = d.distanceMaxAtten
+        config.reverbEnabled = d.reverbEnabled
+        config.reverbRoomType = d.reverbRoomType
+        config.reverbBlend = d.reverbBlend
+        config.globalReverbGain = d.globalReverbGain
         applyConfig()
+    }
+
+    var renderingIsDefault: Bool {
+        let c = config, d = Self.defaults
+        return c.algorithm == d.algorithm && c.interauralDelay == d.interauralDelay
+            && c.distanceAttenuation == d.distanceAttenuation && c.attenuationCurve == d.attenuationCurve
+            && c.distanceRef == d.distanceRef && c.distanceMax == d.distanceMax
+            && c.distanceMaxAtten == d.distanceMaxAtten && c.reverbEnabled == d.reverbEnabled
+            && c.reverbRoomType == d.reverbRoomType && c.reverbBlend == d.reverbBlend
+            && c.globalReverbGain == d.globalReverbGain
     }
 
     // MARK: Polling
@@ -823,42 +863,75 @@ final class EngineController {
     /// reaches a fixed point in one tick instead of asymptotically republishing forever.
     @inline(__always) private func settle(_ x: Float) -> Float { x < 1e-3 ? 0 : x }
 
-    // MARK: Derived UI state
+    // MARK: Derived UI state (computed here so every UI agrees; raw values are the C ABI's)
 
-    /// Single truthful personalization status (spec §1): a chip short-form, a settings long-form
-    /// with a plain-language reason, and whether the accent "engaged" treatment applies.
-    struct HRTFStatus { let short: String; let long: String; let engaged: Bool }
+    enum EngineStatus: UInt32 { case off = 0, starting = 1, on = 2, stopping = 3 }
+
+    /// Engine state — the text pair for the power switch (never position alone). `isStarting`
+    /// is also true for rebuilds while on (config, device swap); those read as On.
+    var engineStatus: EngineStatus {
+        if isStopping { return .stopping }
+        if isStarting && !isOn { return .starting }
+        return isOn ? .on : .off
+    }
+
+    var engineStatusText: String {
+        switch engineStatus {
+        case .off: return "Off"
+        case .starting: return "Starting…"
+        case .on: return "On"
+        case .stopping: return "Stopping…"
+        }
+    }
+
+    enum HRTFState: UInt32 { case inactive = 0, personalized = 1, generic = 2 }
+
+    /// Truthful HRTF status (property 3116): a one-word state for the panel, a sentence for
+    /// the reason, and whether the accent "engaged" treatment applies.
+    struct HRTFStatus { let state: HRTFState; let short: String; let detail: String; let engaged: Bool }
 
     var hrtfStatus: HRTFStatus {
-        if !isOn { return HRTFStatus(short: "—", long: "Inactive — engine off", engaged: false) }
+        if !isOn { return HRTFStatus(state: .inactive, short: "Inactive", detail: "The engine is off.", engaged: false) }
         if personalizedHRTFEngaged {
-            return HRTFStatus(short: "Personalized", long: "Personalized — Apple profile active", engaged: true)
+            return HRTFStatus(state: .personalized, short: "Personalized",
+                              detail: "Your Apple personalized profile is active.", engaged: true)
         }
-        if captureMode == .loopbackDriver {
-            return HRTFStatus(short: "Generic", long: "Generic — virtual-device output can’t carry a personalized profile", engaged: false)
+        if let reason = personalizationDisabledReason {
+            return HRTFStatus(state: .generic, short: "Generic", detail: reason, engaged: false)
         }
-        if config.outputType != .headphones {
-            return HRTFStatus(short: "Generic", long: "Generic — personalized applies to headphones only", engaged: false)
+        if config.hrtfMode == .off {
+            return HRTFStatus(state: .generic, short: "Generic", detail: "Personalized HRTF is turned off.", engaged: false)
         }
-        if config.algorithm != .useOutputType {
-            return HRTFStatus(short: "Generic", long: "Generic — personalized needs the Automatic algorithm", engaged: false)
-        }
-        return HRTFStatus(short: "Generic", long: "Generic — set AirPods with an Apple personalized profile as the system output", engaged: false)
+        return HRTFStatus(state: .generic, short: "Generic",
+                          detail: "Needs AirPods with a personalized Spatial Audio profile as the system output.",
+                          engaged: false)
     }
 
-    /// Head-tracking status (F14): Off (disabled) · Idle (enabled, not tracking) · Tracking
-    /// (enabled, engine running AND live pose). Never claim "Tracking" without live pose.
-    var headTrackStatus: String {
-        guard config.headTracking else { return "Off" }
-        return (isOn && headPoseLive) ? "Tracking" : "Idle"
+    enum HeadTrackState: UInt32 { case off = 0, inactive = 1, tracking = 2, unavailable = 3 }
+
+    /// Head tracking (F14): Off (disabled) · Inactive (engine off) · Tracking (live pose) ·
+    /// Unavailable (running, but no head-motion data). Never claims "Tracking" without pose.
+    var headTrackState: HeadTrackState {
+        guard config.headTracking else { return .off }
+        guard isOn else { return .inactive }
+        return headPoseLive ? .tracking : .unavailable
     }
-    var headTrackActive: Bool { config.headTracking && isOn && headPoseLive }
+
+    var headTrackStatus: String {
+        switch headTrackState {
+        case .off: return "Off"
+        case .inactive: return "Inactive"
+        case .tracking: return "Tracking"
+        case .unavailable: return "Unavailable"
+        }
+    }
+    var headTrackActive: Bool { headTrackState == .tracking }
 
     /// True when personalized HRTF (property 3116) can never engage in the current config, so
-    /// the HRTF-mode picker should be disabled with a reason (F4).
+    /// the HRTF-mode picker is disabled with this reason (F4).
     var personalizationDisabledReason: String? {
         if captureMode == .loopbackDriver { return "Unavailable with the virtual device." }
-        if config.outputType != .headphones { return "Personalized applies to headphones only." }
+        if config.outputType != .headphones { return "Applies to headphones only." }
         if config.algorithm != .useOutputType { return "Needs the Automatic algorithm." }
         return nil
     }
@@ -866,10 +939,7 @@ final class EngineController {
     /// Advisory about Apple Music's Dolby Atmos setting (r4/t4). Only while running; never
     /// written back. In personalized/stereo the ideal is Off; in surround it is Automatic.
     var musicAtmosAdvisory: String? {
-        guard isOn else { return nil }
-        guard let raw = CFPreferencesCopyAppValue("preferredDolbyAtmosPlaySetting" as CFString,
-                                                  "com.apple.Music" as CFString) else { return nil }
-        let setting = (raw as? NSNumber)?.intValue ?? -1   // 10=Automatic 20=Always On 30=Off
+        guard isOn, let setting = musicDolbyAtmosSetting() else { return nil }
         if captureChoice == .surround {
             return setting == 10 ? nil : "For true multichannel, set Music ▸ Settings ▸ Playback ▸ Dolby Atmos to Automatic."
         }
@@ -880,5 +950,17 @@ final class EngineController {
     }
 }
 
-// dBFS helpers shared by the meters/readouts.
-func linearToDb(_ x: Float) -> Float { x > 0 ? 20 * log10(x) : -120 }
+extension EngineController {
+    /// Apple Music's "Dolby Atmos" playback setting (10 Automatic, 20 Always On, 30 Off), or nil
+    /// when Music never wrote it. Re-read at most every 2 s: the snapshot that reports the
+    /// advisory is built at meter rate while a window is visible.
+    fileprivate func musicDolbyAtmosSetting() -> Int? {
+        let now = Date()
+        if let cached = musicSettingCache, now.timeIntervalSince(cached.at) < 2 { return cached.value }
+        let raw = CFPreferencesCopyAppValue("preferredDolbyAtmosPlaySetting" as CFString,
+                                            "com.apple.Music" as CFString)
+        let value = raw.map { ($0 as? NSNumber)?.intValue ?? -1 }
+        musicSettingCache = (value, now)
+        return value
+    }
+}
