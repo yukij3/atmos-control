@@ -41,7 +41,7 @@ It renders stereo and 7.1.4 audio binaurally. It does not decode Dolby Atmos.
 
 3. The app lives in the menu bar and has no Dock icon. Click the menu-bar icon to open the
    panel. The first time you turn the engine on, macOS asks for permission to capture audio,
-   and the panel shows "Waiting for audio-capture permission…" until you answer. Allow it. If
+   and the panel shows "Awaiting capture permission…" until you answer. Allow it. If
    you deny it, the panel offers Open Privacy Settings and Try Again.
 4. Turn off Spatial Audio for your AirPods in Control Center ▸ Sound. Otherwise the audio is
    spatialized twice.
@@ -114,7 +114,7 @@ Quit atmos-control and delete `/Applications/atmos-control.app`. To remove the d
 
 ```bash
 sudo rm -rf /Library/Audio/Plug-Ins/HAL/atmos-control.driver
-sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+sudo killall coreaudiod
 ```
 
 From a source checkout, `./uninstall.sh --with-driver` does both. atmos-control installs no
