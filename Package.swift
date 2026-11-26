@@ -48,8 +48,6 @@ let package = Package(
         ),
         // The app's state model (EngineController: power orchestration, device hot-swap, format
         // recovery, telemetry, head motion) behind the C ABI. Built as libAtmosCore.dylib.
-        // Sources/AtmosControlApp holds the former SwiftUI views; they are no longer built and
-        // stay only as the reference for the Rune port until it reaches parity.
         .target(
             name: "AtmosCore",
             dependencies: ["SpatialEngine", "AtmosCoreABI"],
