@@ -18,8 +18,8 @@ atmos-kit = { path = "crates/atmos-kit" }
 # same git URL and the same rev as this line (Rune's "Depending on Rune"). To bump: read Rune's
 # root Cargo.toml at the new rev and copy its [patch.crates-io] list, all at the new rev.
 rune = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa", default-features = true, features = ["tooling"] }
-# rune-kit's controls (switch, segmented control, buttons), seeded from atmos-kit's tokens
-# (`Theme::kit_seed`). No default features: the app draws no code, so no syntax lexers.
+# Rune's form controls (slider, switch, segmented control, select trigger), seeded from
+# atmos-kit's tokens (`Theme::kit_seed`). Same URL and rev as `rune`; no syntax highlighter.
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa", default-features = false }
 resvg = { version = "0.45", default-features = false }
 

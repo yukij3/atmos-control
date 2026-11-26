@@ -60,6 +60,14 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
             ]
         ),
+        // Offline CPU benchmark + null-test regression harness over the real render path
+        // (same mixer graph + RT callbacks, synthetic input, no device IO).
+        // `swift run -c release EngineBench [--filter x] [--record dir | --compare dir]`.
+        .executableTarget(
+            name: "EngineBench",
+            dependencies: ["SpatialEngine"],
+            path: "Sources/EngineBench"
+        ),
         // Phase 4 spike: prove personalized HRTF (3116) engages while capturing the
         // system mix via a MUTING process tap, WITHOUT hijacking the default output
         // (AirPods stay default). Validates the premium-tier unlock path.

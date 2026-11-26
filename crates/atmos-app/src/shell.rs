@@ -94,7 +94,8 @@ impl Shell {
         }
     }
 
-    fn report_visibility(&self) {
+    /// Tell the engine which surfaces are on screen (also: undo the selftest's override).
+    pub fn report_visibility(&self) {
         self.engine.set_visible(self.panel_visible.get(), self.settings_visible.get());
     }
 

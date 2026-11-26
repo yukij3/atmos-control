@@ -174,6 +174,21 @@ final class UnifiedIOTests: XCTestCase {
         ))
     }
 
+    func testRawABLMatchesAudioBufferListLayout() {
+        XCTAssertEqual(MemoryLayout<AudioBufferList>.offset(of: \AudioBufferList.mBuffers), kAudioBufferListBuffersOffset)
+        let abl = AudioBufferList.allocate(maximumBuffers: 3)
+        defer { free(abl.unsafeMutablePointer) }
+        for i in 0..<3 { abl[i] = AudioBuffer(mNumberChannels: UInt32(i + 1), mDataByteSize: UInt32(100 * i), mData: nil) }
+        let raw = RawABL(abl.unsafeMutablePointer)
+        XCTAssertEqual(raw.count, 3)
+        for i in 0..<3 {
+            XCTAssertEqual(raw[i].mNumberChannels, UInt32(i + 1))
+            XCTAssertEqual(raw[i].mDataByteSize, UInt32(100 * i))
+        }
+        raw[2].mDataByteSize = 7
+        XCTAssertEqual(abl[2].mDataByteSize, 7)
+    }
+
     func testUnifiedModeClampsSurroundModesToStereo() {
         XCTAssertEqual(SpatialEngine.effectiveSourceMode(.surround714, unifiedTap: true), .dualPointStereo)
         XCTAssertEqual(SpatialEngine.effectiveSourceMode(.surroundBed714, unifiedTap: true), .dualPointStereo)
