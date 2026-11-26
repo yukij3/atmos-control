@@ -16,6 +16,9 @@ pub enum MockPreset {
     Off,
     /// Power just switched on, the engine still starting.
     Starting,
+    /// A Personalized start blocked on the macOS audio-capture consent prompt (the engine's
+    /// `awaitingConsent`: "Waiting for audio-capture permission…", still busy).
+    AwaitingConsent,
     /// The tap start failed on audio-capture consent.
     PermissionNeeded,
     /// Off after a failed start.
@@ -28,7 +31,7 @@ pub enum MockPreset {
 
 impl MockPreset {
     pub const ALL: &'static [MockPreset] = &[
-        MockPreset::Playing, MockPreset::Off, MockPreset::Starting, MockPreset::PermissionNeeded,
+        MockPreset::Playing, MockPreset::Off, MockPreset::Starting, MockPreset::AwaitingConsent, MockPreset::PermissionNeeded,
         MockPreset::Error, MockPreset::Speakers, MockPreset::Surround,
     ];
 
@@ -37,6 +40,7 @@ impl MockPreset {
             MockPreset::Playing => "playing",
             MockPreset::Off => "off",
             MockPreset::Starting => "starting",
+            MockPreset::AwaitingConsent => "waiting",
             MockPreset::PermissionNeeded => "permission",
             MockPreset::Error => "error",
             MockPreset::Speakers => "speakers",
@@ -68,6 +72,8 @@ pub struct MockEngine {
     system_output: u32,
     /// The consent prompt was answered: starts succeed.
     granted: bool,
+    /// The start in flight is blocked on the consent prompt (the engine's `awaitingConsent`).
+    awaiting_consent: bool,
     pending: Option<Pending>,
     now: f64,
     visible: (bool, bool),
@@ -80,6 +86,7 @@ impl MockEngine {
             defaults: Config::DEFAULT,
             system_output: AIRPODS,
             granted: true,
+            awaiting_consent: false,
             pending: None,
             now: 0.0,
             visible: (false, false),
@@ -103,12 +110,18 @@ impl MockEngine {
         self.s.generation = generation;
         self.system_output = AIRPODS;
         self.granted = true;
+        self.awaiting_consent = false;
         self.pending = None;
         match preset {
             MockPreset::Playing => self.s.is_on = true,
             MockPreset::Off => {}
             MockPreset::Starting => {
                 self.s.busy = true;
+                self.pending = Some(Pending::Start { at: f64::INFINITY, grant: true });
+            }
+            MockPreset::AwaitingConsent => {
+                self.s.busy = true;
+                self.awaiting_consent = true;
                 self.pending = Some(Pending::Start { at: f64::INFINITY, grant: true });
             }
             MockPreset::PermissionNeeded => {
@@ -168,8 +181,12 @@ impl MockEngine {
         } else {
             EngineStatus::Off
         };
+        if s.engine_status != EngineStatus::Starting {
+            self.awaiting_consent = false;
+        }
         s.engine_status_text = match s.engine_status {
             EngineStatus::Off => "Off",
+            EngineStatus::Starting if self.awaiting_consent => "Waiting for audio-capture permission…",
             EngineStatus::Starting => "Starting…",
             EngineStatus::On => "On",
             EngineStatus::Stopping => "Stopping…",
@@ -492,6 +509,17 @@ mod tests {
         m.retry_capture();
         m.tick(2.0);
         assert!(m.snapshot().is_on && !m.snapshot().permission_needed);
+    }
+
+    #[test]
+    fn a_start_held_by_the_consent_prompt_says_so() {
+        let mut m = MockEngine::new(MockPreset::AwaitingConsent);
+        let s = m.snapshot();
+        assert_eq!((s.engine_status, s.busy), (EngineStatus::Starting, true));
+        assert_eq!(s.engine_status_text, "Waiting for audio-capture permission…");
+        m.power_off();
+        m.tick(1.0);
+        assert_eq!(m.snapshot().engine_status_text, "Off");
     }
 
     #[test]

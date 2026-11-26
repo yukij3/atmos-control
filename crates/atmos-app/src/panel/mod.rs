@@ -19,25 +19,14 @@ use crate::ui;
 
 pub use view::{WIDTH, view};
 
-/// A Personalized start still in "Starting…" after this long is most likely held by the macOS
-/// audio-capture prompt (the first start asks; the engine can't tell the two apart), so the
-/// panel says so and offers Privacy & Security instead of a bare "Starting…".
-const PERMISSION_HINT_AFTER: f64 = 2.0;
-
 pub struct Panel {
     pub shell: Rc<Shell>,
     /// The engine generation this window last drew.
     seen: u64,
-    /// When the current Personalized start began (`Shell::clock` seconds).
-    starting_since: Option<f64>,
-    /// The start has lasted past `PERMISSION_HINT_AFTER`.
-    waiting_for_permission: bool,
 }
 
 impl Panel {
-    pub fn new(shell: Rc<Shell>) -> Panel {
-        Panel { shell, seen: 0, starting_since: None, waiting_for_permission: false }
-    }
+    pub fn new(shell: Rc<Shell>) -> Panel { Panel { shell, seen: 0 } }
 
     /// Catch up with the engine: true when the view must rebuild. Also keeps the menu-bar
     /// glyph current (this runs even while the panel is hidden).
@@ -48,34 +37,14 @@ impl Panel {
         self.shell.sync_tray();
         true
     }
-
-    /// Track how long a Personalized start has run; true when the permission hint flips.
-    fn watch_start(&mut self, now: f64, tx: &mut Tx) -> bool {
-        let can_wait = status::start_can_wait_for_permission(&self.shell.engine.snapshot());
-        self.starting_since = match (can_wait, self.starting_since) {
-            (true, None) => Some(now),
-            (true, since) => since,
-            (false, _) => None,
-        };
-        let waiting = self.starting_since.is_some_and(|t0| now - t0 >= PERMISSION_HINT_AFTER);
-        if let Some(t0) = self.starting_since.filter(|_| !waiting) {
-            tx.wake_after(Duration::from_secs_f64((t0 + PERMISSION_HINT_AFTER - now).max(0.05)));
-        }
-        self.waiting_for_permission != waiting && {
-            self.waiting_for_permission = waiting;
-            true
-        }
-    }
 }
 
-/// Every frame and every wake: the mock's clock, the change check and the start watch.
+/// Every frame and every wake: the mock's clock and the change check.
 pub fn poll(p: &mut Panel, t: f64, tx: &mut Tx) -> bool {
-    let now = p.shell.clock(t);
     let engine = &p.shell.engine;
-    engine.tick(now);
+    engine.tick(p.shell.clock(t));
     if engine.wants_ticks() { tx.wake_after(Duration::from_millis(33)); }
-    let changed = p.sync();
-    p.watch_start(now, tx) || changed
+    p.sync()
 }
 
 pub fn on_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
@@ -98,15 +67,12 @@ pub fn on_visibility(p: &mut Panel, visible: bool, _: &mut Tx) {
 }
 
 /// `--scene <name>` for headless renders (mock engine). `waiting` is a Personalized start held
-/// by the audio-capture prompt (the hint shows at once).
+/// by the macOS audio-capture prompt.
 pub const SCENES: ui::Scenes<Panel> = &[
     ("playing", |p| p.shell.engine.mock_preset(MockPreset::Playing)),
     ("off", |p| p.shell.engine.mock_preset(MockPreset::Off)),
     ("starting", |p| p.shell.engine.mock_preset(MockPreset::Starting)),
-    ("waiting", |p| {
-        p.shell.engine.mock_preset(MockPreset::Starting);
-        p.starting_since = Some(f64::NEG_INFINITY);
-    }),
+    ("waiting", |p| p.shell.engine.mock_preset(MockPreset::AwaitingConsent)),
     ("permission", |p| p.shell.engine.mock_preset(MockPreset::PermissionNeeded)),
     ("error", |p| p.shell.engine.mock_preset(MockPreset::Error)),
     ("speakers", |p| p.shell.engine.mock_preset(MockPreset::Speakers)),

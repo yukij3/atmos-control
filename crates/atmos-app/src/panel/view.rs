@@ -40,7 +40,7 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
     let k = ui::kit(&t, false);
     let engine = &p.shell.engine;
     let s = engine.snapshot();
-    let model = Model::new(&s, p.waiting_for_permission);
+    let model = Model::new(&s);
 
     let mut status = col().key("status").w_full().gap(space::XS).child(status_rows(&model, &t, &k));
     if let Some(advice) = &model.advisory {

@@ -5,7 +5,7 @@
 //! Every row pairs its text with a shape ([`Mark`]): a filled dot for live, a hollow ring for
 //! idle, a turning ring while busy, a warning triangle for a problem. Colour only reinforces it.
 
-use atmos_core::{CaptureChoice, CaptureMode, EngineStatus, HeadTrackState, HrtfState, Snapshot};
+use atmos_core::{CaptureMode, EngineStatus, HeadTrackState, HrtfState, Snapshot};
 
 /// The shape cue beside a status value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,21 +101,23 @@ pub struct Model {
 }
 
 impl Model {
-    /// `waiting_for_permission`: the panel's own observation that a Personalized start has
-    /// been in "Starting…" long enough that the macOS audio-capture prompt is the likely cause
-    /// (the engine can't tell a pending prompt from a slow start).
-    pub fn new(s: &Snapshot, waiting_for_permission: bool) -> Model {
+    pub fn new(s: &Snapshot) -> Model {
         let mut notices = Vec::new();
-        let waiting = waiting_for_permission && s.engine_status == EngineStatus::Starting;
-        if waiting {
+        // A start the engine says more about than "Starting…": a Personalized start blocked on
+        // the macOS audio-capture prompt reads "Waiting for audio-capture permission…" after
+        // 1.5 s (still busy). The engine's own words head the notice.
+        let waiting = waiting_detail(s);
+        if let Some(text) = &waiting {
+            let consent = text.to_lowercase().contains("permission");
             notices.push(Notice {
                 key: "notice-waiting",
                 kind: NoticeKind::Pending,
-                title: "Waiting for audio-capture permission…".into(),
-                detail: Some("Answer the macOS prompt, or allow atmos-control in Privacy & Security.".into()),
-                actions: vec![Action::OpenPrivacy],
+                title: text.clone(),
+                detail: consent.then(|| "Answer the macOS prompt, or allow atmos-control in Privacy & Security.".into()),
+                actions: if consent { vec![Action::OpenPrivacy] } else { Vec::new() },
             });
         }
+        let waiting = waiting.is_some();
         let idle = !s.is_on && !s.busy;
         if idle && s.permission_needed {
             notices.push(Notice {
@@ -160,10 +162,11 @@ fn line(value: impl Into<String>, mark: Option<Mark>, help: impl Into<String>) -
     Line { value: value.into(), mark, help: help.into(), caption: None }
 }
 
-/// The power switch's text pair.
+/// The power switch's text pair. A start the engine says more about keeps the short
+/// "Starting…" here; the notice below carries the engine's words.
 fn engine_line(s: &Snapshot, waiting: bool) -> Line {
     match s.engine_status {
-        EngineStatus::Starting if waiting => line("Starting…", Some(Mark::Busy), "Waiting for macOS to allow audio capture."),
+        EngineStatus::Starting if waiting => line("Starting…", Some(Mark::Busy), s.engine_status_text.clone()),
         EngineStatus::Starting => line("Starting…", Some(Mark::Busy), "Starting the spatializer."),
         EngineStatus::Stopping => line("Stopping…", Some(Mark::Busy), "Stopping; system audio returns to normal."),
         EngineStatus::On => line("On", Some(Mark::Live), "System audio plays through the spatializer."),
@@ -207,10 +210,10 @@ fn head_line(s: &Snapshot) -> Line {
     line(value, Some(mark), help)
 }
 
-/// Whether a start in progress can be waiting on the audio-capture prompt: only the process
-/// tap (Personalized capture) asks for that consent.
-pub fn start_can_wait_for_permission(s: &Snapshot) -> bool {
-    s.engine_status == EngineStatus::Starting && s.capture_choice == CaptureChoice::Personalized
+/// What a start in flight is waiting on, when the engine says more than "Starting…".
+fn waiting_detail(s: &Snapshot) -> Option<String> {
+    let text = s.engine_status_text.trim();
+    (s.engine_status == EngineStatus::Starting && s.busy && !text.is_empty() && text != "Starting…").then(|| text.to_owned())
 }
 
 #[cfg(test)]
@@ -218,15 +221,15 @@ mod tests {
     use super::*;
     use atmos_core::{Engine, MockPreset};
 
-    fn model(preset: MockPreset, waiting: bool) -> Model {
+    fn model(preset: MockPreset) -> Model {
         let e = Engine::mock(preset);
         let s = e.snapshot();
-        Model::new(&s, waiting)
+        Model::new(&s)
     }
 
     #[test]
     fn playing_reads_live_everywhere_with_no_notices() {
-        let m = model(MockPreset::Playing, false);
+        let m = model(MockPreset::Playing);
         assert_eq!((m.engine.value.as_str(), m.engine.mark), ("On", Some(Mark::Live)));
         assert_eq!(m.output.value, "AirPods Pro");
         assert_eq!((m.hrtf.value.as_str(), m.hrtf.mark, m.hrtf.caption.as_deref()), ("Personalized", Some(Mark::Live), None));
@@ -235,18 +238,19 @@ mod tests {
 
     #[test]
     fn generic_hrtf_says_why() {
-        let m = model(MockPreset::Speakers, false);
+        let m = model(MockPreset::Speakers);
         assert_eq!(m.hrtf.value, "Generic");
         assert_eq!(m.hrtf.caption.as_deref(), Some("Applies to headphones only."));
         assert_eq!(m.head.value, "Unavailable");
     }
 
     #[test]
-    fn starting_explains_a_long_wait_as_the_permission_prompt() {
-        let plain = model(MockPreset::Starting, false);
+    fn a_start_held_by_the_consent_prompt_explains_itself() {
+        let plain = model(MockPreset::Starting);
         assert_eq!((plain.engine.value.as_str(), plain.engine.mark), ("Starting…", Some(Mark::Busy)));
         assert!(plain.notices.is_empty());
-        let waiting = model(MockPreset::Starting, true);
+        let waiting = model(MockPreset::AwaitingConsent);
+        assert_eq!(waiting.engine.mark, Some(Mark::Busy));
         assert_eq!(waiting.notices.len(), 1);
         assert_eq!(waiting.notices[0].title, "Waiting for audio-capture permission…");
         assert_eq!(waiting.notices[0].actions, vec![Action::OpenPrivacy]);
@@ -254,10 +258,10 @@ mod tests {
 
     #[test]
     fn problems_offer_their_recovery() {
-        let p = model(MockPreset::PermissionNeeded, false);
+        let p = model(MockPreset::PermissionNeeded);
         assert_eq!(p.engine.mark, Some(Mark::Warn));
         assert_eq!(p.notices[0].actions, vec![Action::OpenPrivacy, Action::RetryCapture]);
-        let e = model(MockPreset::Error, false);
+        let e = model(MockPreset::Error);
         assert_eq!((e.engine.value.as_str(), e.engine.mark), ("Couldn’t start", Some(Mark::Error)));
         assert_eq!(e.notices[0].kind, NoticeKind::Failed);
         assert_eq!(e.notices[0].actions, vec![Action::StartAgain]);
@@ -265,7 +269,7 @@ mod tests {
 
     #[test]
     fn the_surround_advisory_is_information() {
-        let m = model(MockPreset::Surround, false);
+        let m = model(MockPreset::Surround);
         assert!(m.advisory.is_some());
         assert!(m.notices.is_empty());
         assert_eq!(m.hrtf.caption.as_deref(), Some("Unavailable with the virtual device."));
