@@ -45,12 +45,6 @@ use shell::{PANEL_SIZE, PANEL_WIDTH, Shell};
 const PANEL_MIN: (f32, f32) = (PANEL_WIDTH, 120.0);
 const PANEL_MAX: (f32, f32) = (PANEL_WIDTH, 4000.0);
 
-/// Rune flags that make a headless tooling run (no windows, no status item).
-const HEADLESS_FLAGS: &[&str] = &[
-    "--snap", "--tree", "--script", "--video", "--out", "--strip", "--trace", "--list-scenes",
-    "--list-windows", "--desktop", "--html", "--frames", "--first-pixels",
-];
-
 /// NSStatusWindowLevel: above other apps' windows, as menu-bar popovers sit.
 const PANEL_LEVEL: isize = 25;
 /// NSWindowCollectionBehavior: CanJoinAllSpaces | Transient | IgnoresCycle | FullScreenAuxiliary.
@@ -58,8 +52,10 @@ const PANEL_COLLECTION: usize = (1 << 0) | (1 << 3) | (1 << 6) | (1 << 8);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let headless = !args.iter().any(|a| a == "--native")
-        && args.iter().any(|a| HEADLESS_FLAGS.iter().any(|f| a == f || a.starts_with(&format!("{f}="))));
+    // A headless tooling run (no windows, no status item), decided exactly as Rune's `run`
+    // decides it: a hand-kept flag list drifted (`--duration` alone ran headless with the real
+    // engine and a tray icon).
+    let headless = rune::is_headless();
 
     // The last step of every normal quit (⌘Q, menu Quit, logout, a SIGTERM routed below):
     // stop the engine, destroy the tap, restore the default output. Rune ends the process
