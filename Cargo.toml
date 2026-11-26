@@ -1,0 +1,43 @@
+# Rust workspace for the Rune UI (see crates/). The Swift engine stays a SwiftPM package
+# (Package.swift); App/build-app.sh builds both and assembles dist/atmos-control.app.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+atmos-core-sys = { path = "crates/atmos-core-sys" }
+atmos-core = { path = "crates/atmos-core" }
+# Rune is pre-release: pin one `dev` revision. Every [patch.crates-io] entry below must use the
+# same git URL and the same rev as this line (Rune's "Depending on Rune"). To bump: read Rune's
+# root Cargo.toml at the new rev and copy its [patch.crates-io] list, all at the new rev.
+rune = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa", default-features = true, features = ["tooling"] }
+resvg = { version = "0.45", default-features = false }
+
+# Copied from Rune's root Cargo.toml at 66006728af7cd3dc54a6bb31ca7690242fb8d6aa. Cargo does not
+# inherit a dependency's patches, so the app's workspace root must repeat them.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+naga = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "66006728af7cd3dc54a6bb31ca7690242fb8d6aa" }
+
+# Rune's own profile settings: full debug info for its crates is very large.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+codegen-units = 16
+incremental = true

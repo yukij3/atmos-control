@@ -14,3 +14,6 @@ tasks/
 DESIGN.md
 PRODUCT.md
 NOTES-apple-atmos-render.md
+
+# Rust (cargo) build output
+/target/

@@ -1,0 +1,19 @@
+[package]
+name = "atmos-app"
+description = "atmos-control menu-bar app: the Rune UI shell over the Swift engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "atmos-control"
+path = "src/main.rs"
+
+[dependencies]
+atmos-core = { workspace = true }
+# Direct dependency only for its build-script metadata (DEP_ATMOSCORE_LIB_DIR → rpath).
+atmos-core-sys = { workspace = true }
+rune = { workspace = true }
+resvg = { workspace = true }

@@ -1,0 +1,3 @@
+# Same toolchain as the pinned Rune revision (its rust-toolchain.toml).
+[toolchain]
+channel = "1.99.1"
