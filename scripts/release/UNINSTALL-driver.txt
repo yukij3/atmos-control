@@ -1,0 +1,11 @@
+Removing the atmos-control audio driver
+=======================================
+
+Quit atmos-control first. Then, in Terminal:
+
+    sudo rm -rf /Library/Audio/Plug-Ins/HAL/atmos-control.driver
+    sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
+
+Audio devices drop out for about a second while coreaudiod restarts.
+If the system output was left on "atmos-control", pick your real output again in
+System Settings > Sound > Output.
