@@ -3,15 +3,17 @@
 //! (`atmos-core`). One process, one bundle, one TCC identity.
 //!
 //! Windows (both retained, created on first show):
-//! - `panel`: borderless, nonactivating Liquid Glass panel under the menu-bar item; primary
-//!   click on the item toggles it; Esc or clicking elsewhere hides it.
+//! - `panel`: borderless, nonactivating Liquid Glass panel under the menu-bar item, as tall as
+//!   its content; primary click on the item toggles it; Esc or clicking elsewhere hides it.
 //! - `settings`: an ordinary titled window, one instance (menu-bar menu "Settings…", the
 //!   panel, ⌘,).
 //!
 //! Engine: the real one by default; the mock with `--mock` / `ATMOS_ENGINE=mock`, and by
 //! default in headless tooling runs (`--snap`, `--tree`, ...). `ATMOS_MOCK=<preset>` or
 //! `--scene <preset>` picks the mock's state (playing, off, starting, permission, error,
-//! speakers, surround). Examples:
+//! speakers, surround; the panel adds `waiting`, a start held by the audio-capture prompt).
+//! Headless renders show a MOCK badge for the mock engine; `ATMOS_DOCS_SHOT=1` leaves it out
+//! (README screenshots). `ATMOS_DEBUG=1` logs where the panel opens. Examples:
 //!
 //! ```sh
 //! target/release/atmos-control --snap panel.png --scale 2 --at 1.5
@@ -32,7 +34,11 @@ use rune::{App, AppSpec, MacWindowOptions, RunOptions, WindowOptions, WindowSpec
 
 use panel::Panel;
 use settings::Settings;
-use shell::{PANEL_SIZE, Shell};
+use shell::{PANEL_SIZE, PANEL_WIDTH, Shell};
+
+/// The panel's fixed width and the bounds its content height moves within.
+const PANEL_MIN: (f32, f32) = (PANEL_WIDTH, 120.0);
+const PANEL_MAX: (f32, f32) = (PANEL_WIDTH, 4000.0);
 
 /// Rune flags that make a headless tooling run (no windows, no status item).
 const HEADLESS_FLAGS: &[&str] = &[
@@ -61,14 +67,20 @@ fn main() {
             eprintln!("atmos-control: {note}");
         }
 
+        // SF Pro and SF Mono in both windows' sans and mono slots, so rune-kit controls set in
+        // the system font like atmos-kit's text does.
         let panel_app = App::new(AppSpec::<Panel> {
             scenes: panel::SCENES,
             poll: Some(panel::poll),
             on_key: Some(panel::on_key),
-            min_size: Some(PANEL_SIZE),
+            min_size: Some(PANEL_MIN),
+            families: atmos_kit::theme::FAMILIES,
             ..AppSpec::new("atmos-control", PANEL_SIZE, || unreachable!("App::init builds the state"), panel::view)
         })
         .windowless()
+        // The panel is exactly as tall as its content (audit L21); the content caps itself at
+        // the room below the menu bar and scrolls past that.
+        .fit_content_height()
         .on_focus(panel::on_focus)
         .on_visibility(panel::on_visibility);
 
@@ -77,6 +89,7 @@ fn main() {
             poll: Some(settings::poll),
             on_key: Some(settings::on_key),
             min_size: Some(settings::MIN_SIZE),
+            families: atmos_kit::theme::FAMILIES,
             ..AppSpec::new("atmos-control Settings", settings::SIZE, || unreachable!("App::init builds the state"), settings::view)
         })
         .windowless()
@@ -118,8 +131,8 @@ fn main() {
             transparent: true,
             resizable: false,
             always_on_top: true,
-            min_size: Some(PANEL_SIZE),
-            max_size: Some(PANEL_SIZE),
+            min_size: Some(PANEL_MIN),
+            max_size: Some(PANEL_MAX),
             ..Default::default()
         }
         .macos(

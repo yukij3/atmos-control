@@ -1,25 +1,43 @@
 //! The menu-bar panel: a borderless, nonactivating Liquid Glass window under the menu-bar
-//! item. PLACEHOLDER content: it proves the bridge end to end (power, live status text,
-//! numeric meters and head pose); the designed views replace `view` (and `ui`).
+//! item, as tall as its content. Primary click on the item toggles it; Esc, ⌘W or clicking
+//! elsewhere hides it. ⌘, opens Settings, ⌘Q quits.
+//!
+//! - `status`: what the panel says about the engine (rows, notices, recovery actions).
+//! - `view`: the layout (header + power, status, soundstage, quick controls, footer).
+
+mod status;
+mod view;
 
 use std::rc::Rc;
 use std::time::Duration;
 
-use atmos_core::{CaptureChoice, MockPreset, Param, linear_to_db};
-use rune::tok::{self, space, type_};
-use rune::{Cx, El, Key, KeyEvent, SystemMaterial, Tx, col, row, spacer, text};
+use atmos_core::MockPreset;
+use rune::{Key, KeyEvent, Tx};
 
 use crate::shell::{Shell, Surface};
 use crate::ui;
+
+pub use view::{WIDTH, view};
+
+/// A Personalized start still in "Starting…" after this long is most likely held by the macOS
+/// audio-capture prompt (the first start asks; the engine can't tell the two apart), so the
+/// panel says so and offers Privacy & Security instead of a bare "Starting…".
+const PERMISSION_HINT_AFTER: f64 = 2.0;
 
 pub struct Panel {
     pub shell: Rc<Shell>,
     /// The engine generation this window last drew.
     seen: u64,
+    /// When the current Personalized start began (`Shell::clock` seconds).
+    starting_since: Option<f64>,
+    /// The start has lasted past `PERMISSION_HINT_AFTER`.
+    waiting_for_permission: bool,
 }
 
 impl Panel {
-    pub fn new(shell: Rc<Shell>) -> Panel { Panel { shell, seen: 0 } }
+    pub fn new(shell: Rc<Shell>) -> Panel {
+        Panel { shell, seen: 0, starting_since: None, waiting_for_permission: false }
+    }
 
     /// Catch up with the engine: true when the view must rebuild. Also keeps the menu-bar
     /// glyph current (this runs even while the panel is hidden).
@@ -30,19 +48,39 @@ impl Panel {
         self.shell.sync_tray();
         true
     }
+
+    /// Track how long a Personalized start has run; true when the permission hint flips.
+    fn watch_start(&mut self, now: f64, tx: &mut Tx) -> bool {
+        let can_wait = status::start_can_wait_for_permission(&self.shell.engine.snapshot());
+        self.starting_since = match (can_wait, self.starting_since) {
+            (true, None) => Some(now),
+            (true, since) => since,
+            (false, _) => None,
+        };
+        let waiting = self.starting_since.is_some_and(|t0| now - t0 >= PERMISSION_HINT_AFTER);
+        if let Some(t0) = self.starting_since.filter(|_| !waiting) {
+            tx.wake_after(Duration::from_secs_f64((t0 + PERMISSION_HINT_AFTER - now).max(0.05)));
+        }
+        self.waiting_for_permission != waiting && {
+            self.waiting_for_permission = waiting;
+            true
+        }
+    }
 }
 
-/// Every frame and every wake: the mock's clock and the change check.
+/// Every frame and every wake: the mock's clock, the change check and the start watch.
 pub fn poll(p: &mut Panel, t: f64, tx: &mut Tx) -> bool {
+    let now = p.shell.clock(t);
     let engine = &p.shell.engine;
-    engine.tick(p.shell.clock(t));
+    engine.tick(now);
     if engine.wants_ticks() { tx.wake_after(Duration::from_millis(33)); }
-    p.sync()
+    let changed = p.sync();
+    p.watch_start(now, tx) || changed
 }
 
 pub fn on_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
     match ev.key {
-        Key::Escape => p.shell.hide_panel(),
+        Key::Escape | Key::Command('w') => p.shell.hide_panel(),
         Key::Command(',') => p.shell.open_settings(),
         Key::Command('q') => tx.quit(),
         _ => return false,
@@ -59,96 +97,18 @@ pub fn on_visibility(p: &mut Panel, visible: bool, _: &mut Tx) {
     p.shell.set_surface_visible(Surface::Panel, visible);
 }
 
-/// `--scene <name>` for headless renders (mock engine).
+/// `--scene <name>` for headless renders (mock engine). `waiting` is a Personalized start held
+/// by the audio-capture prompt (the hint shows at once).
 pub const SCENES: ui::Scenes<Panel> = &[
     ("playing", |p| p.shell.engine.mock_preset(MockPreset::Playing)),
     ("off", |p| p.shell.engine.mock_preset(MockPreset::Off)),
     ("starting", |p| p.shell.engine.mock_preset(MockPreset::Starting)),
+    ("waiting", |p| {
+        p.shell.engine.mock_preset(MockPreset::Starting);
+        p.starting_since = Some(f64::NEG_INFINITY);
+    }),
     ("permission", |p| p.shell.engine.mock_preset(MockPreset::PermissionNeeded)),
     ("error", |p| p.shell.engine.mock_preset(MockPreset::Error)),
     ("speakers", |p| p.shell.engine.mock_preset(MockPreset::Speakers)),
     ("surround", |p| p.shell.engine.mock_preset(MockPreset::Surround)),
 ];
-
-pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
-    let dark = cx.system_dark();
-    let t = tok::theme(dark);
-    let engine = &p.shell.engine;
-    let s = engine.snapshot();
-    let tel = &s.telemetry;
-
-    let header = row().w_full().gap(space::S2).center_y()
-        .child(text("atmos-control").font(type_::TITLE).color(t.text))
-        .child(spacer())
-        .children(ui::mock_badge(engine, &t))
-        .child(ui::switch("power", "Engine", s.is_on, s.can_toggle(), dark).on_press(|p: &mut Panel| {
-            let can = p.shell.engine.snapshot().can_toggle();
-            if can { p.shell.engine.toggle(); }
-        }));
-
-    let status = col().w_full().gap(space::S1)
-        .child(ui::kv("Engine", &s.engine_status_text, &t))
-        .child(ui::kv("Output", &s.output_name, &t))
-        .child(ui::kv("HRTF", &s.hrtf.short, &t).help(s.hrtf.detail.clone()))
-        .child(ui::kv("Head tracking", &s.head_track.text, &t));
-
-    let db = |x: f32| linear_to_db(x).map_or("\u{2212}\u{221e}".to_owned(), |d| atmos_core::format_number(d, 1, false));
-    let readouts = col().w_full().gap(space::S1)
-        .child(ui::mono_kv("meter-l", "L", &format!("{:>7} dB  peak {:>7}", db(tel.meter_l), db(tel.peak_hold_l)), &t))
-        .child(ui::mono_kv("meter-r", "R", &format!("{:>7} dB  peak {:>7}", db(tel.meter_r), db(tel.peak_hold_r)), &t))
-        .child(ui::mono_kv("head-yaw", "Head yaw", &if tel.head_pose_live {
-            atmos_core::format_number(tel.head_yaw.to_degrees() as f32, 0, true) + "°"
-        } else {
-            "—".into()
-        }, &t))
-        .child(ui::mono_kv("source", "Source", &format!(
-            "{} · {} · {}",
-            Param::Azimuth.format(s.config.azimuth),
-            Param::Elevation.format(s.config.elevation),
-            Param::Distance.format(s.config.distance),
-        ), &t));
-
-    let mut notices = col().w_full().gap(space::S2);
-    if s.permission_needed {
-        notices = notices
-            .child(ui::notice("Allow audio capture in System Settings ▸ Privacy & Security to spatialize system audio.", &t))
-            .child(row().gap(space::S2)
-                .child(ui::button("open-privacy", "Open Privacy Settings", &t).on_press(|p: &mut Panel| p.shell.engine.open_privacy_settings()))
-                .child(ui::button("try-again", "Try Again", &t).on_press(|p: &mut Panel| p.shell.engine.retry_capture())));
-    }
-    if !s.can_run && !s.is_on {
-        notices = notices
-            .child(ui::notice(&format!("{} needs the atmos-control driver, which isn't installed.", s.capture_choice.label()), &t))
-            .child(ui::button("use-personalized", "Use Personalized capture", &t)
-                .on_press(|p: &mut Panel| p.shell.engine.set_capture_choice(CaptureChoice::Personalized)));
-    }
-    if let Some(advice) = &s.music_atmos_advisory {
-        notices = notices.child(text(advice.clone()).w_full().wrap().font(type_::LABEL).color(t.text_secondary));
-    }
-    if let Some(err) = &s.last_error {
-        notices = notices.child(ui::error(err, dark));
-    }
-
-    let footer = row().w_full().gap(space::S2)
-        .child(ui::button("settings", "Settings…", &t).on_press(|p: &mut Panel| p.shell.open_settings()))
-        .child(spacer())
-        .child(ui::button("quit", "Quit", &t).on_press_tx(|_: &mut Panel, tx: &mut Tx| tx.quit()));
-
-    let content = col().key("panel").w_full().h_full().padding(16.0).gap(space::S3)
-        .child(header)
-        .child(ui::separator(&t))
-        .child(status)
-        .child(ui::separator(&t))
-        .child(readouts)
-        .child(notices)
-        .child(spacer())
-        .child(footer);
-
-    // Liquid Glass (NSGlassEffectView) on macOS 26+; the fill is the fallback where native
-    // materials don't draw (headless renders, opaque windows).
-    col().key("glass").w_full().h_full()
-        .radius(ui::PANEL_RADIUS).continuous_corners()
-        .fill(t.bg.alpha(0.92))
-        .system_material(SystemMaterial::Glass)
-        .child(content)
-}
